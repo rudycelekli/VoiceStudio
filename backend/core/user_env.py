@@ -11,6 +11,7 @@ persisted ``HF_TOKEN``) and writes the file ``0600`` (it can hold secrets).
 """
 from __future__ import annotations
 
+import io
 import os
 import re
 from typing import Optional
@@ -79,44 +80,49 @@ def _encode_value(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def _decode_value(raw: str) -> str:
-    if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
-        return re.sub(r"\\(['\\])", r"\1", raw[1:-1])
-    return raw
+def _read_bindings(path: str):
+    from dotenv.parser import parse_stream
+
+    return parse_stream(io.StringIO("\n".join(_read_lines(path))))
 
 
 def get_user_env(key: str, path: Optional[str] = None) -> Optional[str]:
-    path = path or os.environ.get("OMNIVOICE_ENV_FILE") or USER_ENV_PATH  # resolved at call time so tests can monkeypatch
-    prefix = f"{key}="
-    for line in _read_lines(path):
-        if line.startswith(prefix):
-            return _decode_value(line[len(prefix):])
-    return None
+    path = path or os.environ.get("OMNIVOICE_ENV_FILE") or USER_ENV_PATH
+    value = None
+    for binding in _read_bindings(path):
+        if binding.key == key:
+            value = binding.value
+    return value
 
 
 def set_user_env(key: str, value: str, path: Optional[str] = None) -> None:
-    """Upsert ``KEY=value``, preserving all other lines."""
+    """Upsert one effective assignment, preserving all other bindings."""
     path = path or os.environ.get("OMNIVOICE_ENV_FILE") or USER_ENV_PATH
-    prefix = f"{key}="
     encoded = _encode_value(value)
-    lines = _read_lines(path)
+    parts = []
     replaced = False
-    for i, line in enumerate(lines):
-        if line.startswith(prefix):
-            lines[i] = f"{key}={encoded}"
-            replaced = True
-            break
+    for binding in _read_bindings(path):
+        if binding.key == key:
+            if not replaced:
+                parts.append(f"{key}={encoded}\n")
+                replaced = True
+        else:
+            parts.append(binding.original.string)
     if not replaced:
-        lines.append(f"{key}={encoded}")
-    _write_lines(path, lines)
+        if parts and not parts[-1].endswith("\n"):
+            parts.append("\n")
+        parts.append(f"{key}={encoded}\n")
+    _write_lines(path, "".join(parts).splitlines())
 
 
 def unset_user_env(key: str, path: Optional[str] = None) -> None:
-    """Remove ``KEY=...`` if present, preserving all other lines."""
+    """Remove every assignment to ``key``, preserving all other bindings."""
     path = path or os.environ.get("OMNIVOICE_ENV_FILE") or USER_ENV_PATH
-    prefix = f"{key}="
-    lines = [ln for ln in _read_lines(path) if not ln.startswith(prefix)]
-    _write_lines(path, lines)
+    body = "".join(
+        binding.original.string for binding in _read_bindings(path)
+        if binding.key != key
+    )
+    _write_lines(path, body.splitlines())
 
 
 def load_into_environ(path: Optional[str] = None) -> bool:
