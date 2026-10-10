@@ -373,8 +373,8 @@ them when their `Referer` is that origin, so keep the browser's default
 referrer policy on the UI host (a proxy that sets `Referrer-Policy: no-referrer`
 breaks them).
 
-> `OMNIVOICE_PUBLIC_API_BASE` must be a plain `http(s)://…` URL; anything else
-> is ignored and the app falls back to same-origin. If you build from source you
+> `OMNIVOICE_PUBLIC_API_BASE` must be a plain `http(s)://…` URL with a valid host
+> and port, without embedded credentials. Invalid URLs are ignored and the app falls back to same-origin. If you build from source you
 > may instead bake `VITE_OMNIVOICE_API` at build time, but the runtime var above
 > is simpler and image-agnostic.
 

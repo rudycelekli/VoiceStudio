@@ -9,6 +9,8 @@ from __future__ import annotations
 import base64
 import hashlib
 
+import pytest
+
 from core.spa_inject import inject_api_base, is_valid_public_api_base
 
 
@@ -58,3 +60,20 @@ def test_inject_api_base_allows_remote_http_and_websocket_connections():
     doc = '<meta http-equiv="Content-Security-Policy" content="connect-src \'self\' blob:">'
     out = inject_api_base(doc, "https://api.example.com/v1")
     assert "connect-src 'self' https://api.example.com wss://api.example.com blob:" in out
+
+
+@pytest.mark.parametrize("url", [
+    "https://[", "https://[::1", "https://?api", "https://#api",
+    "https://example.com:bad", "https://example.com:65536",
+    "https://user:password@example.com/api",
+])
+def test_public_api_base_rejects_unusable_authorities(url):
+    assert not is_valid_public_api_base(url)
+
+
+@pytest.mark.parametrize("url", [
+    "http://[::1]:3900/api", "https://example.com:443/api",
+])
+def test_public_api_base_accepts_valid_ipv6_and_ports(url):
+    assert is_valid_public_api_base(url)
+    assert "window.__OMNIVOICE_API_BASE__" in inject_api_base("<head></head>", url)

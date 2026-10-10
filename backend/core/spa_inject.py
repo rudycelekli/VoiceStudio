@@ -93,7 +93,16 @@ _URL_RE = re.compile(r"^https?://[^\s<>\"']+$")
 
 def is_valid_public_api_base(value: str) -> bool:
     """True if `value` is a safe http(s) URL we can inject into HTML."""
-    return bool(value) and bool(_URL_RE.match(value))
+    if not value or not _URL_RE.fullmatch(value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        return (
+            bool(parsed.hostname) and parsed.username is None and parsed.password is None
+            and (parsed.port is None or 0 < parsed.port <= 65535)
+        )
+    except ValueError:
+        return False
 
 
 def inject_api_base(html_doc: str, api_base: str) -> str:
