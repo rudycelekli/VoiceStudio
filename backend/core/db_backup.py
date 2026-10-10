@@ -73,7 +73,9 @@ def list_backups(db_path: str) -> list[str]:
             continue
         if not _BACKUP_SUFFIX_RE.search(name[len(base):]):
             continue
-        out.append(os.path.join(directory, name))
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            out.append(path)
     out.sort(key=lambda p: (_mtime(p), p), reverse=True)
     return out
 

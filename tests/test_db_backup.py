@@ -192,3 +192,32 @@ def test_writer_liveness_never_sends_a_signal(monkeypatch):
     monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == 123)
     assert db_backup._pid_alive(123)
     assert not db_backup._pid_alive(124)
+
+
+def test_matching_directory_is_not_a_recovery_backup(tmp_path):
+    db = tmp_path / "omnivoice.db"
+    backup = tmp_path / "omnivoice.db.backup-0.5.7-1"
+    _make_db(backup)
+    directory = tmp_path / "omnivoice.db.backup-0.5.7-2"
+    directory.mkdir()
+    os.utime(backup, (1, 1))
+    os.utime(directory, (2, 2))
+
+    assert db_backup.list_backups(str(db)) == [str(backup)]
+    assert db_backup.latest_backup(str(db))["path"] == str(backup)
+    assert db_backup.prune_backups(str(db), keep=1) == []
+    assert backup.is_file()
+    assert directory.is_dir()
+
+
+def test_matching_directory_does_not_evict_last_real_backup(tmp_path):
+    db = tmp_path / "omnivoice.db"
+    backup = tmp_path / "omnivoice.db.backup-0.5.7-1"
+    _make_db(backup)
+    directory = tmp_path / "omnivoice.db.backup-0.5.7-2"
+    directory.mkdir()
+    os.utime(backup, (1, 1))
+    os.utime(directory, (2, 2))
+
+    assert db_backup.prune_backups(str(db), keep=1) == []
+    assert _rows(backup) == ["voice-0", "voice-1", "voice-2"]
