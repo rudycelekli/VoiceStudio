@@ -15,7 +15,8 @@ import sys
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from core.browser_guard import reject_cross_site_get
 
 logger = logging.getLogger("omnivoice.setup.models")
 router = APIRouter()
@@ -276,6 +277,19 @@ def disk_space_error(to_download_bytes: "int | None", *, cache_dir: "str | None"
     )
 
 
+def disk_full_message(*, cache_dir: "str | None" = None) -> str:
+    """Actionable text for a download that ran out of space *mid-flight*
+    (the preflight guard can't see other writers or an unknown plan size)."""
+    cache = cache_dir or hf_cache_dir()
+    free = disk_free_bytes(cache)
+    have = f"only {free / _GIB:.1f} GB is free" if free > 0 else "the disk is full"
+    return (
+        f"The disk filled up while downloading: {have} at {cache}. Free up space "
+        "(or move the model cache to a bigger volume) and retry; the download "
+        "resumes from the part that already finished."
+    )
+
+
 def _repo_dir_name(repo_id: str) -> str:
     """HF cache dir name for a repo: 'k2-fsa/OmniVoice' → 'models--k2-fsa--OmniVoice'."""
     return "models--" + repo_id.replace("/", "--")
@@ -408,6 +422,37 @@ def cache_is_complete(model: dict) -> bool:
     return any(snapshot_is_complete(model, snapshot) for snapshot in dirs)
 
 
+def installed_snapshot_path(repo_id: str) -> "str | None":
+    """Complete local snapshot directory of an installed catalogue repo, else None.
+
+    Loading an installed model by *repo id* makes huggingface_hub ask the Hub
+    which commit ``main`` is before touching the cache — with no timeout on that
+    call, so a network that drops packets stalls the load, and a pinned-revision
+    install (no ``refs/main``) cannot load offline at all (#2583). A concrete
+    snapshot directory loads with no network. Prefers the recorded installed
+    revision, then the newest complete snapshot. Never raises.
+    """
+    try:
+        meta = get_model_catalog().get(repo_id)
+        if meta is None:
+            return None
+        snapshots = [path for path in _snapshot_dirs(repo_id) if snapshot_is_complete(meta, path)]
+        if not snapshots:
+            return None
+        try:
+            from services.hf_cache_repair import hf_cache_home
+            from services.hf_revisions import installed_revision
+            pinned = installed_revision(repo_id, hf_cache_home())
+        except Exception:  # noqa: BLE001 — uncurated repo: newest snapshot wins
+            pinned = None
+        for path in snapshots:
+            if os.path.basename(path) == pinned:
+                return path
+        return max(snapshots, key=os.path.getmtime)
+    except Exception:  # noqa: BLE001 — callers keep loading by name
+        return None
+
+
 def _is_cached_on_disk(repo_id: str) -> bool:
     """Direct-filesystem fallback for is_cached when scan_cache_dir is unavailable.
 
@@ -531,7 +576,7 @@ def invalidate_cache() -> None:
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
-@router.get("/models/access/status")
+@router.get("/models/access/status", dependencies=[Depends(reject_cross_site_get)])
 def model_access_status(repo_id: str = Query(...)):
     """Check gated Hub access without downloading model files.
 
@@ -568,12 +613,15 @@ def model_access_status(repo_id: str = Query(...)):
         }
 
     from huggingface_hub import get_hf_file_metadata, hf_hub_url
+    from services.hf_auth import CANONICAL_ENDPOINT
 
     results = []
     for current in repositories:
         try:
-            url = hf_hub_url(current, filename=".gitattributes")
-            get_hf_file_metadata(url, token=resolved.token)
+            # Access is an account verdict on Hugging Face itself; a configured
+            # mirror (HF_ENDPOINT) must never receive the token.
+            url = hf_hub_url(current, filename=".gitattributes", endpoint=CANONICAL_ENDPOINT)
+            get_hf_file_metadata(url, token=resolved.token, endpoint=CANONICAL_ENDPOINT)
             access = "granted"
         except Exception as exc:  # Hub exception types vary across releases.
             status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -585,6 +633,16 @@ def model_access_status(repo_id: str = Query(...)):
         "ready": all(item["access"] == "granted" for item in results),
         "repositories": results,
     }
+
+
+def _model_license_info(repo_id: str) -> dict:
+    from services.model_licenses import safe_disclosure
+    return safe_disclosure(repo_id)
+
+
+def _model_licence_acceptance(repo_id: str) -> dict:
+    from services import model_acceptance
+    return model_acceptance.status(repo_id)
 
 
 @router.get("/models")
@@ -653,6 +711,8 @@ def list_models():
             # Curated "best for your system" pick (curated_on in models.yaml) —
             # drives the recommended badge in the wizard and Settings model store.
             "curated": _model_curated(m, host_tags),
+            "license_info": _model_license_info(m["repo_id"]),
+            "license_acceptance": _model_licence_acceptance(m["repo_id"]),
         })
     response = {
         "target": target_key,
@@ -663,6 +723,10 @@ def list_models():
         # BEFORE an "Install all" overruns the disk (pairs with the per-install
         # disk_space_error guard in setup/download.py).
         "disk_free_gb": None if remote_inventory is not None else round(disk_free_bytes() / _GIB, 1),
+        # The headroom disk_space_error keeps free on top of every download, so
+        # the UI warns with the same rule (and names it) instead of a raw
+        # "needs 4.8 GB, 10.2 GB free" that contradicts its own refusal (#2597).
+        "disk_headroom_gb": MIN_FREE_GB,
         "platform_tags": platform_tags,
     }
     _set_cache(cache_key, response)
@@ -706,6 +770,16 @@ def recommendations():
         if _model_curated(m, tags) and _model_supported(m)
     ]
 
+    if not (is_mac_arm or has_cuda or has_rocm):
+        # CPU-only preset: lead with the light Whisper (small) so a user working
+        # down the list meets the cheap download before large-v3 / Turbo. Only
+        # the ASR slots are reordered (smallest first); every other entry keeps
+        # its catalog position.
+        asr_slots = [i for i, m in enumerate(curated) if m.get("role") == "ASR"]
+        ordered = sorted((curated[i] for i in asr_slots), key=lambda m: m.get("size_gb") or 0)
+        for slot, model in zip(asr_slots, ordered):
+            curated[slot] = model
+
     if is_mac_arm:
         rationale = (
             "Apple Silicon preset: VoiceStudio (required) covers multilingual TTS + "
@@ -730,9 +804,9 @@ def recommendations():
     else:
         rationale = (
             "CPU preset: VoiceStudio (required) runs standalone. Optional picks favour "
-            "speed on CPU — Whisper large-v3 (int8) for accuracy, Turbo when speed "
-            "matters, Whisper Tiny (ONNX) for live dictation, KittenTTS for "
-            "instant English TTS."
+            "speed on CPU — Whisper small (int8) as the light default, large-v3 for "
+            "accuracy and Turbo when you can spare the time and RAM, Whisper Tiny "
+            "(ONNX) for live dictation, KittenTTS for instant English TTS."
         )
 
     remote_inventory = _target_repo_inventory()
@@ -793,3 +867,4 @@ def recommendations():
         "total_gb": round(sum(e["size_gb"] for e in entries), 2),
         "all_installed": all_installed,
     }
+

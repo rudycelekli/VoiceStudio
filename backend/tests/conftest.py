@@ -24,6 +24,8 @@ developer's real app state) with zero ``sys.modules`` surgery. This mirrors
 Do NOT reintroduce module-level ``sys.modules`` stubs in this directory —
 import the real module and rely on this conftest instead.
 """
+import importlib.abc
+import importlib.machinery
 import os
 import sys
 import tempfile
@@ -39,6 +41,9 @@ if not os.environ.get("OMNIVOICE_ENV_FILE"):
     os.environ["OMNIVOICE_ENV_FILE"] = os.path.join(
         os.environ["OMNIVOICE_DATA_DIR"], "user-env"
     )
+# TestClient's "http://testserver" host must pass the DNS-rebinding guard
+# (core.browser_guard); mirrors tests/conftest.py.
+os.environ.setdefault("OMNIVOICE_ALLOWED_HOSTS", "testserver")
 # TTS checkpoint sentinel — mirrors tests/conftest.py (both assign the same
 # value, so load order doesn't matter). Unconditional on purpose (#1175
 # review): an ambient OMNIVOICE_MODEL from the dev's shell (set for running
@@ -72,6 +77,60 @@ def supports_symlinks() -> bool:
         return True
     finally:
         shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+_LICENCE_STUB: dict = {"active": False, "stubbed": []}
+
+
+class _LicenceDefaultFinder(importlib.abc.MetaPathFinder):
+    """Stub ``ensure_accepted`` on every copy of services.model_acceptance.
+
+    Tests here re-import backend modules mid-test (``_reimported_backend_modules``),
+    so the copy the app uses can be created after the fixture below ran. Mirrors
+    tests/conftest.py, where the enforcement tests live.
+    """
+
+    def find_spec(self, name, path=None, target=None):
+        if name != "services.model_acceptance":
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, path)
+        if spec is None or spec.loader is None:
+            return spec
+        loader, run = spec.loader, spec.loader.exec_module
+
+        def exec_module(module):
+            run(module)
+            if _LICENCE_STUB["active"]:
+                _stub_licence_module(module)
+
+        loader.exec_module = exec_module
+        return spec
+
+
+def _stub_licence_module(module) -> None:
+    _LICENCE_STUB["stubbed"].append((module, module.ensure_accepted))
+    module.ensure_accepted = lambda repo_ids: None
+
+
+sys.meta_path.insert(0, _LicenceDefaultFinder())
+
+
+@pytest.fixture(autouse=True)
+def _model_licences_accepted_by_default():
+    """Gated model licences read as accepted; mirrors tests/conftest.py, where
+    the enforcement tests live and opt back in with ``model_licence_gate``."""
+    _LICENCE_STUB["active"] = True
+    from services import model_acceptance as _ma
+
+    if all(m is not _ma for m, _ in _LICENCE_STUB["stubbed"]):
+        _stub_licence_module(_ma)
+    try:
+        yield
+    finally:
+        _LICENCE_STUB["active"] = False
+        for module, original in reversed(_LICENCE_STUB["stubbed"]):
+            module.ensure_accepted = original
+        _LICENCE_STUB["stubbed"].clear()
 
 
 @pytest.fixture(scope="session")
@@ -140,69 +199,5 @@ def _clear_asr_installed_memo(request):
     _clear_all()
 
 
-@pytest.fixture(autouse=True)
-def _clean_model_manager_shutdown_state(request):
-    """Start every test with the model manager NOT in shutdown mode (#1269).
-
-    ``model_manager._shutting_down`` is a module-global Event and the GPU pool is
-    a module-global executor. Any test that runs the app lifespan flips both on
-    the way out — ``begin_shutdown()`` plus ``_reset_gpu_pool()`` — and nothing
-    puts them back, because in production that state is correct: the process is
-    ending.
-
-    Across a combined ``pytest tests/ backend/tests/`` session it is not
-    correct, and it is not a cosmetic leak. A test that arrives with the flag set
-    finds a shut-down executor, so its very first ``run_in_executor`` raises
-    "cannot schedule new futures after shutdown" — which the preload path
-    classifies as a benign shutdown and swallows. The symptom is a load that
-    silently never starts: ``test_lifespan_shutdown_mid_load_is_clean_and_clears
-    _sentinel`` failed on ``assert started.is_set()`` for exactly this reason,
-    while passing alone.
-
-    Reset before AND after: before so an inherited flag cannot decide this test,
-    after so a test that legitimately shuts down does not hand the state on.
-
-    Cleans the module in ``sys.modules`` AND any module-typed alias the test
-    module holds (``import services.model_manager as mm`` at module scope) — the
-    same stale-alias class ``asr_model_installed`` above handles. Test modules
-    bind that alias at COLLECTION time; ``tests/backend/**`` purges
-    ``services.*`` from ``sys.modules`` after every test it owns, so in a
-    combined ``pytest tests/ backend/tests/`` run the alias and the live module
-    are two different objects. Cleaning only one of them means a test dirties
-    the alias and the next test reads it still dirty
-    (``test_shutdown_state_isolation.py::test_next_test_starts_clean``).
-    """
-    import types
-
-    def _targets():
-        # Import rather than probe sys.modules: unchanged from the original
-        # fixture, and it guarantees a live module to reset even in a run where
-        # a sibling suite purged the name.
-        import services.model_manager as mod
-
-        # `import x.y as z` binds the PACKAGE ATTRIBUTE, which can diverge from
-        # the sys.modules entry after module surgery — take both.
-        found = {id(m): m for m in (mod, sys.modules.get("services.model_manager"))
-                 if m is not None}
-        test_module = getattr(request, "module", None)
-        if test_module is not None:
-            for val in vars(test_module).values():
-                if (isinstance(val, types.ModuleType)
-                        and getattr(val, "__name__", "") == "services.model_manager"):
-                    found[id(val)] = val
-        return found.values()
-
-    def _clean():
-        # Deliberately NOT wrapped in try/except. A reset that fails silently
-        # leaves the next test with stale shutdown or executor state, which is
-        # precisely the order-dependent failure this fixture exists to remove —
-        # swallowing the error would defeat the fixture while looking like it
-        # worked (CodeRabbit). If either of these can raise, that is a real
-        # problem in model_manager and it should be loud.
-        for mod in _targets():
-            mod.reset_shutdown_flag()
-            mod._reset_gpu_pool()
-
-    _clean()
-    yield
-    _clean()
+# The shutdown-state reset (#1269) lives in the repository-root conftest.py so
+# that tests/ gets it as well: CI runs that whole directory in one process.

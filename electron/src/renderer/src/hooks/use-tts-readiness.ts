@@ -3,6 +3,7 @@ import { resolveRemoteRuntime } from '@/components/app-shell/status-runtime';
 import { useComputeRuntime, useComputeTarget } from './use-compute-target';
 import { engineFamilyState, useEngines } from './use-engines';
 import { useBackendStatus } from './use-backend-status';
+import { isBackendReachable } from '@shared/utils/backendStage';
 
 export type TtsReadinessBlocker = 'engine' | 'loading' | 'cloning' | null;
 
@@ -16,7 +17,7 @@ export function useTtsReadiness(operation = 'tts', requireLocal = false): TtsRea
   // Resolve the target for this exact surface. If a chosen worker is offline
   // or does not support the operation, routing falls back to Local and the
   // local readiness checks below remain authoritative.
-  const computeTarget = useComputeTarget(backend.stage === 'ready', operation);
+  const computeTarget = useComputeTarget(isBackendReachable(backend.stage), operation);
   const remoteTarget = computeTarget.data?.active.remote
     ? computeTarget.data.active.worker_id
     : undefined;
@@ -26,9 +27,12 @@ export function useTtsReadiness(operation = 'tts', requireLocal = false): TtsRea
     remoteTarget,
     activeEngine,
     operation,
-    backend.stage === 'ready' && Boolean(remoteTarget),
+    isBackendReachable(backend.stage) && Boolean(remoteTarget),
   );
-  if (backend.stage !== 'ready') return 'loading';
+  // A live-but-busy backend (#2430) is not a loading state: it is mid-job, so
+  // the engine answers as soon as that job releases the event loop. Blocking
+  // generation here is what left the workspace visible but unusable.
+  if (!isBackendReachable(backend.stage)) return 'loading';
   if (engines.isLoading) return 'loading';
   if (engines.isError || !engines.data || !activeEngine) return 'engine';
   if (computeTarget.isLoading) return 'loading';

@@ -65,7 +65,7 @@ def export_file(req: ExportRequest):
         # Video exports: overlay VoiceStudio logo if visible watermark is enabled
         if src.lower().endswith(".mp4"):
             from services.watermark import is_visible_video_enabled, get_ffmpeg_overlay_args
-            from services.ffmpeg_utils import find_ffmpeg
+            from services.ffmpeg_utils import find_ffmpeg, local_inputs_only
             logo_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "docs", "logo.png")
             logo_path = os.path.realpath(logo_path)
             if is_visible_video_enabled() and os.path.exists(logo_path):
@@ -80,9 +80,11 @@ def export_file(req: ExportRequest):
                 if overlay_args and ffmpeg:
                     try:
                         subprocess.run(
-                            [ffmpeg, "-y", "-i", src, "-i", logo_path]
-                            + overlay_args
-                            + ["-codec:a", "copy", dest],
+                            local_inputs_only(
+                                [ffmpeg, "-y", "-i", src, "-i", logo_path]
+                                + overlay_args
+                                + ["-codec:a", "copy", dest]
+                            ),
                             check=True,
                             capture_output=True,
                             timeout=120,

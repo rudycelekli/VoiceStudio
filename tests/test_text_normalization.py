@@ -298,7 +298,7 @@ def test_idempotent_double_encoded_entity():
     assert normalize_text(once, None) == once
 
 
-# ── Toggle: pref (default ON) + env override ─────────────────────────────────
+# ── Toggle: default ON + env override ────────────────────────────────────────
 
 def test_enabled_by_default(monkeypatch):
     monkeypatch.delenv(text_normalization.ENV_VAR, raising=False)
@@ -306,15 +306,12 @@ def test_enabled_by_default(monkeypatch):
     assert normalize_for_tts("I have 2 cats", "English") == "I have two cats"
 
 
-def test_pref_off_bypasses(monkeypatch):
+def test_never_written_pref_does_not_toggle_normalization(monkeypatch):
+    """Only the env var switches it off; no Settings surface writes a pref."""
     monkeypatch.delenv(text_normalization.ENV_VAR, raising=False)
     import core.prefs as prefs_mod
-    monkeypatch.setattr(
-        prefs_mod, "get",
-        lambda key, default=None: False if key == text_normalization.PREF_KEY else default,
-    )
-    raw = "I have 2 cats!!!!!!"
-    assert normalize_for_tts(raw, "English") == raw  # byte-identical bypass
+    monkeypatch.setattr(prefs_mod, "get", lambda key, default=None: False)
+    assert normalization_enabled() is True
 
 
 def test_env_off_bypasses(monkeypatch):
@@ -542,3 +539,17 @@ def test_complete_signed_decimal_ranges(raw, expected):
 ])
 def test_malformed_or_protected_ranges_remain_unchanged(raw):
     assert normalize_text(raw, "ko") == raw
+
+
+@pytest.mark.parametrize(("env", "expected"), [(None, True), ("1", True), ("off", False), ("0", False)])
+def test_pronunciation_switch_is_env_only(monkeypatch, env, expected):
+    from api.routers.generation import pronunciation_enabled
+    import core.prefs as prefs_mod
+
+    if env is None:
+        monkeypatch.delenv("OMNIVOICE_PRONUNCIATION", raising=False)
+    else:
+        monkeypatch.setenv("OMNIVOICE_PRONUNCIATION", env)
+    # A never-written pref must not change the outcome.
+    monkeypatch.setattr(prefs_mod, "get", lambda key, default=None: False)
+    assert pronunciation_enabled() is expected

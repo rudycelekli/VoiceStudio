@@ -1,4 +1,5 @@
 import { createStreamingPreview, supportsStreamingPreview } from '@/lib/audio/streaming-preview';
+import { announceModelLicenceRequired } from '@/features/settings/model-license-contract';
 import { backendWebSocketUrl } from '@/lib/api/websocket';
 import { beginAppActivity } from '@/lib/app-activity';
 import { acquireSynthesis } from '@/lib/synthesis-lock';
@@ -113,7 +114,13 @@ export function useDubLivePreview({ enabled, language }: { enabled: boolean; lan
             active.player?.appendPcm16Bytes(event.data);
             return;
           }
-          let message: { type?: string; sample_rate?: number; detail?: string };
+          let message: {
+            type?: string;
+            sample_rate?: number;
+            detail?: string;
+            code?: string;
+            models?: unknown;
+          };
           try {
             message = JSON.parse(String(event.data)) as typeof message;
           } catch {
@@ -121,9 +128,12 @@ export function useDubLivePreview({ enabled, language }: { enabled: boolean; lan
           }
           if (message.type === 'start' && Number.isFinite(message.sample_rate)) {
             active.player = createStreamingPreview(message.sample_rate!, 0, () => {
-              if (session.current !== active) return;
-              session.current = null;
-              setLiveSegmentId(null);
+              // Fires on a normal tail finishing AND when the playback manager
+              // cancels output (stop / another preview). Cancelling mid-stream
+              // still owns the socket and the synthesis slot, so release them
+              // through the one stop path (#2511); after `done` they are
+              // already released and this only clears the row.
+              if (session.current === active) stop();
             });
           } else if (message.type === 'done') {
             active.socket = null;
@@ -136,6 +146,7 @@ export function useDubLivePreview({ enabled, language }: { enabled: boolean; lan
               setLiveSegmentId(null);
             }
           } else if (message.type === 'error') {
+            announceModelLicenceRequired(message);
             notify('stream', t('tts_errors.error_prefix', { message: message.detail || '' }));
             stop();
           }

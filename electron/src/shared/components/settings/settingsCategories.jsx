@@ -346,6 +346,7 @@ export const GROUPS = [
           'orcarouter',
           'cheaper inference',
           'groq',
+          'iflytek',
           'ollama',
           'gemini',
           'cinematic',

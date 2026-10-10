@@ -5,6 +5,7 @@ import { languageRejectionMessage } from '@shared/utils/languageRejection.ts';
 import type { ApiErrorPayload } from './types';
 import { tr } from '@/lib/i18n-text';
 import { getBackendStatusSnapshot } from '@/hooks/use-backend-status';
+import { isBackendReachable } from '@shared/utils/backendStage';
 import { recordBackendContact } from '@shared/utils/backendContact';
 import {
   clearAdminSession,
@@ -13,6 +14,10 @@ import {
   isSameOriginApi,
 } from '@shared/api/authSession';
 import { joinApiPath } from '../../../../shared/web-api-routing';
+import {
+  announceModelLicenceRequired,
+  modelLicenceRequirements,
+} from '@/features/settings/model-license-contract';
 export { joinApiPath } from '../../../../shared/web-api-routing';
 
 type ApiBaseWindow = Window & { __OMNIVOICE_API_BASE__?: string };
@@ -122,7 +127,11 @@ export async function errorFromResponse(res: Response): Promise<ApiError> {
       // Plain-text body.
     }
   }
+  // Any feature can hit a model whose licence is not yet accepted; one
+  // app-level dialog handles them all.
+  const licence = announceModelLicenceRequired(payload) ? modelLicenceRequirements(payload) : null;
   const detail =
+    (licence && tr('modelLicense.requiredError')) ||
     generationFailureMessage(payload, tr) ||
     (payload && 'detail' in payload
       ? detailToString(payload.detail)
@@ -135,16 +144,24 @@ export async function errorFromResponse(res: Response): Promise<ApiError> {
   return new ApiError(res.status, detail || statusLine, payload);
 }
 
+/** Fired after a successful `POST /engines/select`. */
+export const ENGINE_SELECTED_EVENT = 'ov:engine-selected';
+
 /**
  * fetch() against the API. Throws ApiError on any non-2xx response and an
  * ApiError with status 0 when the backend is unreachable. Deliberate aborts
  * are re-thrown untouched so callers can tell them apart.
  */
 export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  // #2430: only a stage that cannot answer at all short-circuits here. A
+  // live-but-busy `unresponsive` backend is still listening, so the request is
+  // issued and simply resolves late, when the job holding the event loop
+  // finishes. Rejecting it up front is what made fetching the audio of an
+  // already-succeeded streamed generation fail.
   if (
     typeof window !== 'undefined' &&
     window.voicestudio?.backend &&
-    getBackendStatusSnapshot().stage !== 'ready'
+    !isBackendReachable(getBackendStatusSnapshot().stage)
   )
     throw new ApiError(0, tr('tts_errors.backend_unreachable'));
   let res: Response;
@@ -187,6 +204,10 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
     }
     throw error;
   }
+  // The active engine decides which compute route (and so which generate
+  // budget) a take gets; consumers re-read their derived state on this event.
+  if (typeof window !== 'undefined' && path === '/engines/select' && init?.method === 'POST')
+    window.dispatchEvent(new CustomEvent(ENGINE_SELECTED_EVENT));
   return res;
 }
 

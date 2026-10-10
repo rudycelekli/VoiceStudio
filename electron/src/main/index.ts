@@ -272,6 +272,9 @@ if (process.env.VOICESTUDIO_ALLOW_MULTIPLE_INSTANCES !== '1' && !app.requestSing
           () => backend.baseUrl,
           () => backend.requestHeaders(),
           Number(process.env.VOICESTUDIO_ELECTRON_PROXY_PORT) || 3903,
+          process.env.ELECTRON_RENDERER_URL
+            ? [new URL(process.env.ELECTRON_RENDERER_URL).origin]
+            : [],
         );
         closeDevProxy = proxy.close;
       }

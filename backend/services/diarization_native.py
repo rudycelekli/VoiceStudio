@@ -56,8 +56,14 @@ class NativeSortformer:
     """Stateless native invocation; the GGUF is never downloaded implicitly."""
 
     def __init__(self):
+        from services.diarization_runtime import SORTFORMER_REPO, sortformer_model_path
+        from services.model_acceptance import ensure_accepted
+
+        # Built per use, so this also applies a revoked acceptance (#2689).
+        # A user-configured GGUF is a local asset with no registry identity.
+        if not os.environ.get("OMNIVOICE_DIARIZATION_MODEL", "").strip():
+            ensure_accepted([SORTFORMER_REPO])
         from engines.audiocpp.bootstrap import resolve_server_binary
-        from services.diarization_runtime import sortformer_model_path
 
         try:
             self.model = sortformer_model_path()
@@ -142,13 +148,13 @@ class NativeSortformer:
                     raise RuntimeError(f"Native Sortformer failed (exit {code})")
             if (audio_info.samplerate != 16000 or audio_info.channels != 1
                 or audio_info.format != "WAV" or audio_info.subtype != "PCM_16"):
-                from services.ffmpeg_utils import find_ffmpeg
+                from services.ffmpeg_utils import find_ffmpeg, local_inputs_only
                 normalized = Path(directory) / "input.wav"
-                run_owned([
+                run_owned(local_inputs_only([
                     find_ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                     "-i", str(source), "-vn", "-ac", "1", "-ar", "16000",
                     "-c:a", "pcm_s16le", str(normalized),
-                ], "normalize.log")
+                ], tool="ffmpeg"), "normalize.log")
                 source = normalized
                 audio_info = sf.info(str(source))
                 command[command.index("--audio") + 1] = str(source)

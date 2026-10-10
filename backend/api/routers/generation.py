@@ -16,13 +16,14 @@ import threading
 import traceback
 from pathlib import Path
 from typing import Optional, Literal
-from fastapi import APIRouter, File, Form, UploadFile, HTTPException
+from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Depends
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import sqlite3
 from core.db import db_conn, ensure_schema
 from core.config import OUTPUTS_DIR, VOICES_DIR
+from core.path_security import contained_join
 import functools
 from services.model_manager import (
     get_model, _gpu_pool, run_on_gpu_pool_guarded, GpuJobTimeoutError,
@@ -32,10 +33,12 @@ from services.generation_audio import save_generation_wav
 # Compatibility export used by archetype previews and the gallery renderer.
 from services.audio_io import _safe_torchaudio_save
 from services.binary_preflight import InvalidBinaryError
+from services.model_acceptance import ModelLicenceNotAccepted
 from core import event_bus
 from core.render_trace import call as trace_call
 from core.logging_utils import log_safe
 from omnivoice.utils.voice_design import heal_design_instruct
+from core.browser_guard import reject_cross_site_get
 
 router = APIRouter()
 logger = logging.getLogger("omnivoice.generate")
@@ -79,8 +82,8 @@ def _cached_ogg(key: tuple[str, int, int, int]) -> bytes | None:
         return encoded
 
 
-@router.get("/audio/{audio_id}.ogg")
-@router.get("/audio/{audio_id}.opus")
+@router.get("/audio/{audio_id}.ogg", dependencies=[Depends(reject_cross_site_get)])
+@router.get("/audio/{audio_id}.opus", dependencies=[Depends(reject_cross_site_get)])
 async def generated_ogg_opus(audio_id: str):
     """Serve the same render as /audio/<id>.wav, encoded as Ogg/Opus."""
     if not re.fullmatch(r"[0-9a-f]{8}", audio_id):
@@ -287,6 +290,102 @@ def _profile_instruct(row):
     return heal_design_instruct(row["instruct"], vd)
 
 
+def _design_instruct_key(value):
+    """Order-, case- and spacing-insensitive identity of an instruct.
+
+    Clients rebuild a design voice's tags in their own order (the sanitizer
+    sorts by category), so string equality would call an unchanged voice
+    edited.
+    """
+    return frozenset(
+        item.strip().casefold()
+        for item in re.split(r"[,\uff0c]", str(value or ""))  # ASCII or full-width comma
+        if item.strip()
+    )
+
+
+def _design_request_diverges(row, *, instruct=None, seed=None):
+    """True when a request edits a design profile instead of re-rendering it.
+
+    A design profile's rendered sample *is* the voice it was saved with. A
+    request that sends a different instruct or seed asks for a different
+    voice; cloning the old sample would drown the new attributes, which is
+    how "Male" kept coming back female once a design was saved. An omitted
+    instruct or seed means "the profile's", so it never diverges; an explicit
+    seed on a profile saved without one asks for a specific voice the saved
+    sample was never rendered with, so it does.
+    """
+    if instruct and str(instruct).strip():
+        requested = _design_instruct_key(instruct)
+        stored = {
+            _design_instruct_key(row["instruct"]),
+            _design_instruct_key(_profile_instruct(row)),
+        }
+        if requested not in stored:
+            return True
+    if seed is None:
+        return False
+    return row["seed"] is None or int(seed) != int(row["seed"])
+
+
+def _conditioning_refusal(backend_cls, *, profile_id=None, has_ref_audio=False,
+                          instruct=None, seed=None, design_recipe=None):
+    """Why this request can't run on ``backend_cls``, else None.
+
+    Two conditioning mismatches would otherwise fail deep inside the engine
+    or, worse, render the wrong voice without a word:
+
+    * designing on an engine that declares it can't
+      (``supports_voice_design = False``): a request with no reference clip
+      that describes a voice (an instruct or a Voice Design recipe) or names
+      a design profile without a saved sample;
+    * a reference clip on an engine that declares it can't clone
+      (``supports_cloning = False``): an uploaded clip, or a profile whose
+      conditioning resolves to its saved sample. Such engines ignore
+      ``ref_audio``, so re-rendering a saved voice there would silently use
+      a preset voice instead.
+
+    Plain preset-voice TTS (no reference, no description) stays allowed, and
+    a model-dependent ``supports_cloning`` property is judged by the loaded
+    model later, not here. Refusing before any model load turns both into an
+    actionable 422.
+    """
+    from services.tts_backend import voice_design_support
+
+    designing = bool(
+        (instruct and str(instruct).strip())
+        or (design_recipe and str(design_recipe).strip())
+    )
+    # /generate ignores an upload when a profile is named.
+    reference = has_ref_audio and not profile_id
+    if profile_id:
+        with db_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM voice_profiles WHERE id=?", (profile_id,)
+            ).fetchone()
+        if row is not None:
+            cond = _resolve_profile_conditioning(row, instruct=instruct, seed=seed)
+            reference = bool(cond["ref_audio_path"])
+            designing = designing or cond["kind"] == "design"
+    name = getattr(backend_cls, "display_name", None) or getattr(backend_cls, "id", "This engine")
+    if reference:
+        if getattr(backend_cls, "supports_cloning", True) is False:
+            return (
+                f"{name} can't use reference audio: it only speaks with its own "
+                "preset voices, so it can't render this voice from its sample. "
+                "Choose an engine that supports voice cloning (for example "
+                "OmniVoice)."
+            )
+        return None
+    if not designing or voice_design_support(backend_cls) is not False:
+        return None
+    return (
+        f"{name} can't design a voice from a description: it needs a reference "
+        "clip for the timbre. Choose an engine that supports Voice Design "
+        "(for example OmniVoice), or clone a voice from a reference clip instead."
+    )
+
+
 def _resolve_profile_conditioning(row, *, ref_text=None, instruct=None,
                                   seed=None, language=None):
     """Resolve a ``voice_profiles`` row into generation conditioning.
@@ -306,6 +405,9 @@ def _resolve_profile_conditioning(row, *, ref_text=None, instruct=None,
         "ref_audio_path": None, "ref_text": ref_text, "instruct": instruct,
         "seed": seed, "language": language, "kind": None,
         "persist_ref_text": False, "language_from_profile": False,
+        # True when the request edits a design profile rather than
+        # re-rendering it: its saved sample no longer describes the voice.
+        "diverged": False,
     }
     # `kind` is authoritative (0005): 'design' profiles condition on their
     # deterministic rendered sample + instruct; 'clone' on the user's
@@ -319,8 +421,18 @@ def _resolve_profile_conditioning(row, *, ref_text=None, instruct=None,
             row["instruct"] and not row["is_locked"] and not row["ref_audio_path"]
         ) else "clone"
     out["kind"] = profile_kind
-    if row["is_locked"] and row["locked_audio_path"]:
-        out["ref_audio_path"] = os.path.join(VOICES_DIR, row["locked_audio_path"])
+    if profile_kind == "design" and _design_request_diverges(
+        row, instruct=instruct, seed=seed,
+    ):
+        # Design from the request's attributes and seed; only the gaps it
+        # left (an omitted instruct or seed) come from the profile.
+        out["diverged"] = True
+        if not out["instruct"]:
+            out["instruct"] = _profile_instruct(row)
+        if out["seed"] is None and row["seed"] is not None:
+            out["seed"] = row["seed"]
+    elif row["is_locked"] and row["locked_audio_path"]:
+        out["ref_audio_path"] = contained_join(VOICES_DIR, row["locked_audio_path"])
         if not out["ref_text"]:
             out["ref_text"] = row["ref_text"]
         if not out["instruct"]:
@@ -330,9 +442,7 @@ def _resolve_profile_conditioning(row, *, ref_text=None, instruct=None,
     elif profile_kind == "design":
         # Rendered sample (if present) carries the voice identity; instruct
         # alone is the fallback for legacy archetype rows.
-        out["ref_audio_path"] = (
-            os.path.join(VOICES_DIR, row["ref_audio_path"]) if row["ref_audio_path"] else None
-        )
+        out["ref_audio_path"] = contained_join(VOICES_DIR, row["ref_audio_path"])
         if out["ref_audio_path"] and not out["ref_text"] and row["ref_text"]:
             out["ref_text"] = row["ref_text"]
         if not out["instruct"]:
@@ -347,9 +457,7 @@ def _resolve_profile_conditioning(row, *, ref_text=None, instruct=None,
         if out["seed"] is None and row["seed"] is not None:
             out["seed"] = row["seed"]
     else:
-        out["ref_audio_path"] = (
-            os.path.join(VOICES_DIR, row["ref_audio_path"]) if row["ref_audio_path"] else None
-        )
+        out["ref_audio_path"] = contained_join(VOICES_DIR, row["ref_audio_path"])
         if not out["ref_text"] and row["ref_text"]:
             out["ref_text"] = row["ref_text"]
         elif out["ref_audio_path"] and not out["ref_text"]:
@@ -1684,6 +1792,17 @@ def _apply_routing_headers(headers, engine_notice, decision):
     return headers
 
 
+@router.get("/generate/budget")
+def generate_budget(engine: Optional[str] = None):
+    """Active generate budgets, so the UI's backstop follows operator overrides.
+
+    ``engine`` (default: the active engine) selects the local route the
+    CPU-ceiling hint is reported for."""
+    from services.model_manager import generate_budget_s
+
+    return generate_budget_s(engine)
+
+
 @router.post("/generate")
 async def generate_speech(
     text: str = Form(...),
@@ -1714,8 +1833,8 @@ async def generate_speech(
     max_chunk_chars: int = Form(800, ge=0),
     crossfade_ms: int = Form(50, ge=0, le=1000),
     # Expressive-TTS Spec 01: apply the user pronunciation dictionary + inline
-    # [[…]] overrides to the text before synthesis. Default ON; the global
-    # OMNIVOICE_PRONUNCIATION pref can disable it for power users. Omitting it
+    # [[…]] overrides to the text before synthesis. Default ON; the
+    # OMNIVOICE_PRONUNCIATION env var can disable it for power users. Omitting it
     # with an empty dictionary is byte-identical to legacy behavior.
     pronounce: bool = Form(True),
     # Streaming preview: when true, the response is application/x-ndjson —
@@ -1764,6 +1883,20 @@ async def generate_speech(
                 "See GET /engines/tts for the list of valid engine ids."
             ),
         )
+    # Before any routing, eviction or load, and for remote renders too: the
+    # licence is accepted by the user asking for the audio. Raises the 403.
+    from services.tts_backend import ensure_engine_licence
+    ensure_engine_licence(backend_cls)
+
+    # A design request on an engine that needs a reference clip would only
+    # fail inside the engine, after a model load, and a reference on an
+    # engine that can't clone would be silently dropped. Say so before any work.
+    _refused = _conditioning_refusal(
+        backend_cls, profile_id=profile_id, has_ref_audio=ref_audio is not None,
+        instruct=instruct, seed=seed, design_recipe=design_recipe,
+    )
+    if _refused:
+        raise HTTPException(status_code=422, detail=_refused)
 
     # Crash forensics (#1164): a generate is exactly the kind of work an OOM
     # kill lands on — record it (engine id only, never the text) so an
@@ -1941,7 +2074,6 @@ async def generate_speech(
         with db_conn() as conn:
             row = conn.execute("SELECT * FROM voice_profiles WHERE id=?", (profile_id,)).fetchone()
         if row:
-            resolved_profile_id = profile_id
             # Shared with POST /convert — see _resolve_profile_conditioning
             # for the resolution rules (kind-authoritative, lock wins, #533
             # language fill, #1032 transcript-cache signal).
@@ -1949,6 +2081,8 @@ async def generate_speech(
                 row, ref_text=ref_text, instruct=instruct, seed=used_seed,
                 language=language,
             )
+            # An edited design is a new voice, not a take of this profile.
+            resolved_profile_id = None if _cond["diverged"] else profile_id
             history_mode = _cond["kind"]
             ref_audio_path = _cond["ref_audio_path"]
             ref_text = _cond["ref_text"]
@@ -2061,14 +2195,7 @@ async def generate_speech(
     # covers generate for every engine. Pure text substitution → identical on
     # mac/Win/Linux. A disabled pref or empty dictionary is a pass-through, so
     # plain text stays byte-identical (#G5 backward-compat).
-    from core import prefs as _prefs
-    _pron_env = os.environ.get("OMNIVOICE_PRONUNCIATION")
-    if _pron_env is not None:
-        # Env wins (power-user override); "0"/"false"/"no"/"off" disable it.
-        _pron_enabled = _pron_env.strip().lower() not in ("0", "false", "no", "off", "")
-    else:
-        _pron_enabled = bool(_prefs.get("pronunciation_enabled", True))
-    if pronounce and _pron_enabled:
+    if pronounce and pronunciation_enabled():
         from services.pronunciation import apply_pronunciation, load_entries_from_db
         try:
             _pron_rows = load_entries_from_db()
@@ -2603,7 +2730,10 @@ async def generate_speech(
                 # is compute time, not queue pressure (#1588).
                 logger.error("Streaming generation exceeded its compute budget")
                 from core.public_errors import stream_failure
-                failure = stream_failure("generation_timeout")
+                failure = stream_failure(
+                    "generation_timeout",
+                    device=_routing.get("effective_device"),
+                )
                 failure["retry_after"] = 30
                 yield _line({"type": "error", **failure})
             except ValueError as e:
@@ -2764,7 +2894,7 @@ async def generate_speech(
             media_type="audio/wav",
             headers=_resp_headers,
         )
-    except HTTPException:
+    except (HTTPException, ModelLicenceNotAccepted):
         raise
     except gpu_gateway.ModelNotDownloaded as e:
         size_bytes = None
@@ -2884,9 +3014,23 @@ def _safe_output_path(name):
     return candidate
 
 
-def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=()):
+def _remove_deferred_wavs(paths) -> None:
+    """Delete WAVs queued by ``_remove_wav_if_unreferenced(..., defer=...)``.
+
+    Call this AFTER the ``db_conn()`` block exits (its commit succeeded): a
+    rolled-back delete must never have already unlinked the audio its
+    surviving rows still point at."""
+    for p in paths:
+        with contextlib.suppress(OSError):
+            os.remove(p)
+
+
+def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=(), defer=None):
     """Delete a history WAV from OUTPUTS_DIR — but only when no *other*
     generation_history row still references the same file.
+
+    With ``defer`` (a list) the path is appended instead of removed, so the
+    caller can unlink after its transaction commits (``_remove_deferred_wavs``).
 
     History WAVs are uniquely owned by their row (lock/save-as-profile COPY
     into VOICES_DIR, exports copy to the user's destination), so this guard is
@@ -2905,6 +3049,9 @@ def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=()):
     ).fetchone()[0]
     if others:
         return
+    if defer is not None:
+        defer.append(p)
+        return
     with contextlib.suppress(OSError):
         os.remove(p)
 
@@ -2913,6 +3060,14 @@ def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=()):
 # WAVs). User-tunable via Settings → Storage; 0 = unlimited. The pref key is
 # shared with api/routers/settings.py (the GET/PUT endpoint) — same pattern as
 # perf.torch_compile_disabled, which settings.py and engine_env.py both name.
+def pronunciation_enabled() -> bool:
+    """The pronunciation dictionary is on unless OMNIVOICE_PRONUNCIATION is
+    "0"/"false"/"no"/"off". Env only: a prefs key was once read here too, but
+    no Settings surface ever wrote it."""
+    value = os.environ.get("OMNIVOICE_PRONUNCIATION")
+    return value is None or value.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 HISTORY_CAP_PREF_KEY = "generation_history_cap"
 DEFAULT_HISTORY_CAP = 200
 
@@ -2936,6 +3091,7 @@ def _prune_history_over_cap(*, keep_id: str | None = None) -> int:
     cap = _history_cap()
     if cap <= 0:
         return 0  # 0 = unlimited
+    doomed: list[str] = []
     with db_conn() as conn:
         total = conn.execute("SELECT COUNT(*) FROM generation_history").fetchone()[0]
         excess = total - cap
@@ -2954,12 +3110,16 @@ def _prune_history_over_cap(*, keep_id: str | None = None) -> int:
             "DELETE FROM generation_history WHERE id=?", [(i,) for i in victim_ids]
         )
         for r in victims:
-            _remove_wav_if_unreferenced(conn, r["audio_path"], exclude_ids=victim_ids)
-        logger.info("history retention: pruned %d takes over the %d cap", len(victims), cap)
-        return len(victims)
+            _remove_wav_if_unreferenced(
+                conn, r["audio_path"], exclude_ids=victim_ids, defer=doomed
+            )
+    # Files go only after the row deletion has committed.
+    _remove_deferred_wavs(doomed)
+    logger.info("history retention: pruned %d takes over the %d cap", len(victims), cap)
+    return len(victims)
 
 
-@router.get("/history")
+@router.get("/history", dependencies=[Depends(reject_cross_site_get)])
 def list_history():
     """The newest 50 generations plus every starred take, newest first, kept to
     rows whose audio still exists on disk.
@@ -3033,23 +3193,29 @@ def set_history_starred(history_id: str, body: _StarBody):
 def clear_history():
     with db_conn() as conn:
         rows = conn.execute("SELECT audio_path FROM generation_history").fetchall()
-        for r in rows:
-            p = _safe_output_path(r["audio_path"])
-            if p and os.path.exists(p):
-                with contextlib.suppress(OSError):
-                    os.remove(p)
         conn.execute("DELETE FROM generation_history")
+    # Row deletion committed first: a failed commit must not leave rows whose
+    # audio is already gone.
+    for r in rows:
+        p = _safe_output_path(r["audio_path"])
+        if p and os.path.exists(p):
+            with contextlib.suppress(OSError):
+                os.remove(p)
     event_bus.emit("generation_history")
     return {"cleared": True}
 
 @router.delete("/history/{history_id}")
 def delete_single_history(history_id: str):
+    doomed: list[str] = []
     with db_conn() as conn:
         row = conn.execute("SELECT audio_path FROM generation_history WHERE id=?", (history_id,)).fetchone()
         conn.execute("DELETE FROM generation_history WHERE id=?", (history_id,))
         if row:
             # Row first, file second — the WAV goes only if no surviving take
             # still references it (see _remove_wav_if_unreferenced).
-            _remove_wav_if_unreferenced(conn, row["audio_path"], exclude_ids=(history_id,))
+            _remove_wav_if_unreferenced(
+                conn, row["audio_path"], exclude_ids=(history_id,), defer=doomed
+            )
+    _remove_deferred_wavs(doomed)  # after the commit, never before
     event_bus.emit("generation_history", {"action": "deleted", "id": history_id})
     return {"deleted": True}

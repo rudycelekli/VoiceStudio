@@ -23,6 +23,7 @@ import time
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from typing import Optional
+from core.path_security import upload_suffix
 
 router = APIRouter()
 logger = logging.getLogger("omnivoice.capture")
@@ -91,7 +92,7 @@ async def transcribe_audio(
     import asyncio
 
     # Save upload to a temp file (all backends need a file path)
-    ext = os.path.splitext(audio.filename or "audio.wav")[1] or ".wav"
+    ext = upload_suffix(audio.filename, ".wav") or ".wav"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     try:
         content = await audio.read()
@@ -166,6 +167,7 @@ async def transcribe_audio(
             ASRTimeoutError,
             run_transcribe_guarded,
         )
+        from services.model_acceptance import ModelLicenceNotAccepted
         t0 = time.perf_counter()
         try:
             result, engine_id, sherpa_model_id = await run_transcribe_guarded(
@@ -184,6 +186,8 @@ async def transcribe_audio(
                 status_code=409,
                 detail={**e.payload, "message": asr_model_missing_detail(e.payload)},
             )
+        except ModelLicenceNotAccepted:
+            raise  # typed 403 via the app handler (#2689)
         except Exception as e:
             # Each ASR engine decodes the upload its own way (ffmpeg, PyAV,
             # libsndfile), so a video with no audio stream fails with a

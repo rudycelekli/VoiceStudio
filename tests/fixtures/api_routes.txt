@@ -17,6 +17,7 @@ DELETE /history
 DELETE /history/{history_id}
 DELETE /longform/jobs/{job_id}
 DELETE /marketplace/{filename}
+DELETE /models/licenses/receipts/{plan_digest}
 DELETE /models/{repo_id:path}
 DELETE /profiles/{profile_id}
 DELETE /profiles/{profile_id}/consent
@@ -35,6 +36,7 @@ GET /api/settings/compute-device
 GET /api/settings/cuda-device
 GET /api/settings/db-backup
 GET /api/settings/dictation-refinement
+GET /api/settings/gpu-report
 GET /api/settings/hf-mirror
 GET /api/settings/hf-token/state
 GET /api/settings/history-retention
@@ -43,6 +45,7 @@ GET /api/settings/llm-endpoint
 GET /api/settings/llm-providers
 GET /api/settings/llm-providers/{provider_id}/models
 GET /api/settings/llm-skills
+GET /api/settings/perf/offload-after-generation
 GET /api/settings/perf/torch-compile-disabled
 GET /api/settings/performance-profile
 GET /api/settings/storage
@@ -116,6 +119,7 @@ GET /gallery/categories
 GET /gallery/voices
 GET /gallery/voices/{voice_id}
 GET /gallery/voices/{voice_id}/preview
+GET /generate/budget
 GET /glossary/{project_id}
 GET /health
 GET /history
@@ -130,6 +134,9 @@ GET /model/status
 GET /models
 GET /models/access/status
 GET /models/install/status
+GET /models/licenses/acceptance/{repo_id:path}
+GET /models/licenses/details/{repo_id:path}
+GET /models/licenses/receipts/{plan_digest}
 GET /openapi.json
 GET /personalities
 GET /preview/{filename}
@@ -220,6 +227,7 @@ POST /dub/import-srt/{job_id}
 POST /dub/ingest-url
 POST /dub/parse-subtitle-text
 POST /dub/preview-segment/{job_id}
+POST /dub/prosody-mirror/{job_id}
 POST /dub/qc/{job_id}
 POST /dub/transcribe/{job_id}
 POST /dub/translate
@@ -264,6 +272,11 @@ POST /media-tools/{tool}/use-system
 POST /model/unload/{model_id}
 POST /models/install
 POST /models/install/cancel
+POST /models/install/commit
+POST /models/install/prepare
+POST /models/licenses/accept
+POST /models/licenses/revoke
+POST /models/licenses/verify/{plan_digest}
 POST /personas/export/{profile_id}
 POST /personas/import
 POST /personas/inspect
@@ -328,6 +341,7 @@ PUT /api/settings/history-retention
 PUT /api/settings/llm-endpoint
 PUT /api/settings/llm-providers/{provider_id}
 PUT /api/settings/llm-skills/{skill_id}
+PUT /api/settings/perf/offload-after-generation
 PUT /api/settings/perf/torch-compile-disabled
 PUT /api/settings/performance-profile
 PUT /api/settings/storage/models-dir

@@ -35,13 +35,15 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query, Depends
 from fastapi.responses import FileResponse
 
 from core import archetypes
 from core.audio_validation import is_playable_wav, resolve_regular_file
 from core.config import OUTPUTS_DIR, VOICES_DIR
 from services import gallery
+from services.model_acceptance import ModelLicenceNotAccepted
+from core.browser_guard import reject_cross_site_get
 
 logger = logging.getLogger("omnivoice.archetypes")
 
@@ -306,7 +308,7 @@ def _is_unusable_audio(audio_tensor) -> bool:
     return flatness is not None and flatness < _DEGENERATE_FLATNESS
 
 
-async def _render_archetype_wav(a: dict, out_path: Path) -> None:
+async def _render_archetype_wav(a: dict, out_path: Path, *, allow_model_load: bool = True) -> None:
     """Render an archetype's sample script to ``out_path`` using the live engine.
 
     Reuses generation.py's inference primitives so there is exactly one TTS code
@@ -321,7 +323,9 @@ async def _render_archetype_wav(a: dict, out_path: Path) -> None:
         _safe_torchaudio_save,
     )
 
-    model = await get_model()
+    # Save-time samples are optional: an unload after the residency probe must
+    # not turn persistence into a cold load. Explicit previews retain loading.
+    model = await get_model() if allow_model_load else await get_model(allow_load=False)
     language = a["language"]
     if language in (None, "", "Auto"):
         language = None
@@ -528,7 +532,7 @@ def preview_archetype_state(archetype_id: str):
     return {"source": source, "message": message}
 
 
-@router.get("/archetypes/{archetype_id}/preview")
+@router.get("/archetypes/{archetype_id}/preview", dependencies=[Depends(reject_cross_site_get)])
 async def preview_archetype(
     archetype_id: str,
     local: bool = Query(False, description="Bypass gallery audio after a client decode failure"),
@@ -560,6 +564,8 @@ async def preview_archetype(
     if not is_playable_wav(cache_path):
         try:
             await _render_wav_atomic(a, cache_path, prefix=".preview-")
+        except ModelLicenceNotAccepted:
+            raise  # the structured 403 that opens the acceptance dialog
         except Exception as e:  # model missing / OOM / inference failure
             logger.error("Archetype preview render failed", exc_info=True)
             # Two different failures, two different answers. Without a model
@@ -625,6 +631,8 @@ async def use_archetype(archetype_id: str, name: Optional[str] = Query(None)):
             audio_filename, audio_path = await _render_profile_audio(
                 a, profile_id, publish=existing is None,
             )
+        except ModelLicenceNotAccepted:
+            raise  # the structured 403 that opens the acceptance dialog
         except Exception as e:
             logger.error("Archetype 'use' render failed", exc_info=True)
             # Same actionable/diagnostic split as /preview — minus the gallery
@@ -671,6 +679,8 @@ async def use_archetype(archetype_id: str, name: Optional[str] = Query(None)):
         if audio_path is None:
             try:
                 audio_filename, audio_path = await _render_profile_audio(a, profile_id)
+            except ModelLicenceNotAccepted:
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=503, detail="Couldn't create a voice from this archetype.",

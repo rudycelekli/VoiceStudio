@@ -29,6 +29,7 @@ from core.auth import (
     principal_for,
     remote_api_key,
 )
+from core.browser_guard import reject_cross_site_get
 from core.csrf import SAFE_HTTP_METHODS, cookie_csrf_allowed
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -172,7 +173,7 @@ def require_loopback(request: Request) -> None:
             # Defense in depth. Privileged routers should declare
             # ``require_admin`` directly, but a missed migration must not turn
             # into an unauthenticated Docker write primitive.
-            require_admin(request)
+            check_admin(request)
             return
         if not _admin_credential_configured(request):
             return
@@ -206,7 +207,18 @@ def _admin_gate_403() -> None:
     )
 
 
-def require_admin(request: Request) -> None:
+async def require_admin(request: Request) -> None:
+    """FastAPI dependency form of :func:`check_admin`.
+
+    ``async`` on purpose: the check is pure in-memory work, and a sync
+    dependency is dispatched through the shared worker pool, so every request
+    on every admin router (including the one-per-second status polls) queued
+    behind whatever blocked sync route had filled it (#2594 class).
+    """
+    check_admin(request)
+
+
+def check_admin(request: Request) -> None:
     """Gate RCE/filesystem-capable admin routers.
 
     Desktop callers keep the loopback-only contract. Docker cannot reliably
@@ -237,8 +249,10 @@ def require_admin_action(request: Request) -> None:
 
     A small number of legacy GET endpoints have real side effects. For example,
     an engine health check may spawn a sidecar process. Such routes cannot use
-    :func:`require_admin`'s bare-server discovery exception.
+    :func:`require_admin`'s bare-server discovery exception, and another
+    website must not be able to trigger them with a link or an image.
     """
+    reject_cross_site_get(request)
     host = request.client.host if request.client else None
     if is_loopback(host):
         return

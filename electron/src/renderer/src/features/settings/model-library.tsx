@@ -14,6 +14,7 @@ import {
   SearchIcon,
   SparklesIcon,
   Trash2Icon,
+  TriangleAlertIcon,
   type LucideIcon,
   WrenchIcon,
   XIcon,
@@ -25,6 +26,7 @@ import { ExternalLink } from '@/components/external-link';
 import { Input } from '@/components/ui/input';
 import { ConfirmDialog } from '@/features/clone/confirm-dialog';
 import { engineFamilyState, useEngines } from '@/hooks/use-engines';
+import { relaxWhenBackendBusy } from '@/lib/status-polling';
 import {
   modelInstallJobTarget,
   TERMINAL_MODEL_INSTALL_STATES,
@@ -40,7 +42,9 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { SettingsSection, SettingsRow } from './settings-layout';
 import { familyIcons, type ModelFamily } from './model-family';
 import { useModelCatalogue, type CatalogueModel } from './model-catalogue-query';
+import { ModelLicense } from './model-license';
 import { resolvePerformanceModelPack } from './performance-model-packs';
+import { modelDiskShortfall } from './model-disk-space';
 import { fmtBytes } from '@shared/components/settings/models/format';
 import {
   engineSelectionFeedback,
@@ -141,8 +145,14 @@ export function PerformanceModelPacks({ compact = false }: { compact?: boolean }
   const progressBytes = activeJobs.reduce((total, job) => total + (job.bytes_done ?? 0), 0);
   const progressTotal = activeJobs.reduce((total, job) => total + (job.total_bytes ?? 0), 0);
   const progress = progressTotal > 0 ? Math.round((progressBytes / progressTotal) * 100) : null;
-  const diskFree = catalogue.data?.disk_free_gb;
-  const lowDisk = pack.missing.length > 0 && diskFree != null && pack.downloadGb + 10 > diskFree;
+  const diskShortfall = pack.missing.length
+    ? modelDiskShortfall(
+        pack.downloadGb,
+        catalogue.data?.disk_free_gb,
+        catalogue.data?.disk_headroom_gb,
+      )
+    : null;
+  const lowDisk = diskShortfall !== null;
   const busy = starting || profile.isSaving || activeJobs.length > 0;
 
   const refresh = () =>
@@ -288,10 +298,10 @@ export function PerformanceModelPacks({ compact = false }: { compact?: boolean }
           </div>
         )}
 
-        {lowDisk && (
+        {diskShortfall && (
           <p role="alert" className="flex items-start gap-2 text-xs text-warning-foreground">
             <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-            {t('models.reco_low_disk', { need: pack.downloadGb.toFixed(1), free: diskFree })}
+            {t('models.pack_low_disk', { ...diskShortfall })}
           </p>
         )}
 
@@ -403,7 +413,11 @@ export function SystemRecommendations() {
   };
   const anyActive = activeDownloads.size > 0;
   const requiredGb = requiredMissing.reduce((sum, model) => sum + model.size_gb, 0);
-  const lowDisk = diskFree != null && data.download_gb_remaining > diskFree;
+  const diskShortfall = modelDiskShortfall(
+    data.download_gb_remaining,
+    diskFree,
+    catalogue.data?.disk_headroom_gb,
+  );
 
   return (
     <SettingsSection
@@ -445,16 +459,13 @@ export function SystemRecommendations() {
             </div>
           )}
         </div>
-        {lowDisk && (
+        {diskShortfall && (
           <p
             role="alert"
             className="flex items-start gap-2 text-xs leading-relaxed text-warning-foreground"
           >
             <AlertTriangleIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
-            {t('models.reco_low_disk', {
-              need: data.download_gb_remaining,
-              free: diskFree,
-            })}
+            {t('models.reco_low_disk', { ...diskShortfall })}
           </p>
         )}
         {data.all_installed ? (
@@ -589,7 +600,7 @@ export function ModelLibrary({
     queryFn: () => apiJson<LoadedModelsResponse>('/model/loaded'),
     enabled: !setup,
     staleTime: 5_000,
-    refetchInterval: 15_000,
+    refetchInterval: () => relaxWhenBackendBusy(15_000),
   });
   const models = catalogue.data?.models.filter((model) => {
     if (setup) return model.supported !== false;
@@ -836,6 +847,7 @@ export function ModelLibrary({
             label: 'settings.storage',
           };
         case 'HF_MIRROR_UNREACHABLE':
+        case 'HF_MIRROR_GATED':
           return {
             to: '/settings/models' as const,
             label: 'models.mirror_title',
@@ -930,6 +942,13 @@ export function ModelLibrary({
             {t('firstrun.chip_recommended')}
           </span>
         )}
+        <ModelLicense
+          repoId={model.repo_id}
+          label={model.label}
+          info={model.license_info}
+          acceptance={model.license_acceptance}
+          target={installTarget}
+        />
         {!activeAsrModel &&
           (activeEngineModel || activeDictationModel || activeDiarisationModel) && (
             <span className="flex items-center gap-1 rounded-full bg-primary/10 px-2 py-1 text-xs text-primary">
@@ -1025,7 +1044,9 @@ export function ModelLibrary({
               {t('modelMaintenance.failed')}
             </summary>
             <p role="alert" className="mt-2 break-words text-muted-foreground">
-              {job?.error || t('modelMaintenance.failed')}
+              {job?.docs_topic === 'HF_MIRROR_GATED'
+                ? t('modelMaintenance.mirrorGatedAccess')
+                : job?.error || t('modelMaintenance.failed')}
             </p>
             <div className="mt-2 flex flex-wrap gap-1">
               <Button
@@ -1106,10 +1127,18 @@ export function ModelLibrary({
           </>
         ) : model.installed ? (
           <>
-            <span className="flex items-center gap-1 text-xs">
-              <CheckIcon className="size-3.5" />
-              {t('modelMaintenance.installed')}
-            </span>
+            {model.license_acceptance?.required && !model.license_acceptance.accepted ? (
+              // Downloaded but unusable until its licence is accepted.
+              <span className="flex items-center gap-1 rounded-full bg-warning/10 px-2 py-1 text-xs text-warning">
+                <TriangleAlertIcon className="size-3.5" />
+                {t('modelLicense.acceptNeeded')}
+              </span>
+            ) : (
+              <span className="flex items-center gap-1 text-xs">
+                <CheckIcon className="size-3.5" />
+                {t('modelMaintenance.installed')}
+              </span>
+            )}
             {!setup && resident && (
               <span
                 className="flex items-center gap-1 rounded-full bg-primary/10 px-2 py-1 text-xs text-primary"

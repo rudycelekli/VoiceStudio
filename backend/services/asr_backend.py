@@ -333,28 +333,28 @@ def _decode_audio_16k_mono(audio_path: str):
 
     import numpy as np
 
-    from services.ffmpeg_utils import find_ffmpeg
+    from services.ffmpeg_utils import MediaToolUnavailableError, find_ffmpeg, local_inputs_only
 
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
-        raise RuntimeError(
+        raise MediaToolUnavailableError(
             "Cannot transcribe: ffmpeg is missing or not runnable. Install "
             "ffmpeg (or let VoiceStudio's bundled binary download), then retry. "
             "On Windows a '[WinError 193]' here means the ffmpeg binary is "
             "corrupt or the wrong architecture — reinstall it or clear the "
             "imageio-ffmpeg cache."
         )
-    cmd = [
+    cmd = local_inputs_only([
         ffmpeg, "-nostdin", "-threads", "0", "-i", audio_path,
         "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", "16000", "-",
-    ]
+    ], tool="ffmpeg")
     try:
         out = subprocess.run(cmd, capture_output=True, check=True).stdout
     except OSError as e:
         # Belt-and-suspenders: find_ffmpeg() already -version-validated this
         # binary, so a WinError 193 here is unexpected — surface it clearly
         # rather than letting it become "no segments".
-        raise RuntimeError(
+        raise MediaToolUnavailableError(
             f"ffmpeg at {ffmpeg!r} could not be executed ({e}). Reinstall "
             "ffmpeg or clear the imageio-ffmpeg cache."
         ) from e
@@ -577,8 +577,9 @@ def load_align_model(language_code: str, device: str):
     """Lazy-load (and cache) the wav2vec2 aligner for a language.
 
     Returns ``(model, metadata)``, or ``None`` when no aligner exists for the
-    language — WhisperX bundles them for ~20 major languages only, and the
-    caller then keeps Whisper's own (looser) word timestamps."""
+    language — WhisperX bundles them for ~20 major languages only — or it
+    cannot be loaded on ``device``. The caller then keeps Whisper's own
+    (looser) word timestamps, after trying any fallback device."""
     key = (language_code, device)
     if key in _ALIGN_CACHE:
         return _ALIGN_CACHE[key]
@@ -591,9 +592,9 @@ def load_align_model(language_code: str, device: str):
         _ALIGN_CACHE[key] = (model, metadata)
     except Exception as e:  # noqa: BLE001 — missing aligner is normal, not fatal
         logger.info(
-            "no wav2vec2 aligner for language=%r (%s); "
+            "no wav2vec2 aligner for language=%r on %s (%s); "
             "falling back to Whisper's native word timestamps",
-            language_code, e,
+            language_code, device, e,
         )
         _ALIGN_CACHE[key] = None
     return _ALIGN_CACHE[key]
@@ -624,9 +625,18 @@ def forced_align(segments: list, audio, language_code: str, device: str | None =
         devices = ["cpu"]
 
     for i, dev in enumerate(devices):
+        last = i == len(devices) - 1
         align = load_align_model(language_code, dev)
         if align is None:
-            return segments  # no aligner for this language — not a device problem
+            # ``None`` means the aligner could not be loaded on THIS device: an
+            # unsupported language, but just as well an MPS load failure. Only
+            # the always-works device can tell the two apart, so a failed load
+            # on the fast device falls through to it like a failed align does
+            # (#2570). An unsupported language fails fast on every device.
+            if last:
+                return segments
+            logger.info("aligner load failed on %s — retrying on %s", dev, devices[i + 1])
+            continue
         model_a, metadata = align
         try:
             import whisperx
@@ -636,7 +646,6 @@ def forced_align(segments: list, audio, language_code: str, device: str | None =
             )
             return result.get("segments", segments)
         except Exception as e:  # noqa: BLE001
-            last = i == len(devices) - 1
             if last:
                 logger.warning(
                     "forced alignment failed on %s: %s — using native word timestamps", dev, e,
@@ -812,7 +821,7 @@ class WhisperXBackend(ASRBackend):
         self._allow_vad_pickle_globals()
         try:
             self._asr = whisperx.load_model(
-                self._model_name,
+                _local_model_source(self._model_name),
                 device=self._device,
                 compute_type=self._compute_type,
                 # vad_method="silero" is the default; keep it so short gaps
@@ -840,7 +849,7 @@ class WhisperXBackend(ASRBackend):
                     self._compute_type = ct
                     try:
                         self._asr = whisperx.load_model(
-                            self._model_name,
+                            _local_model_source(self._model_name),
                             device=self._device,
                             compute_type=self._compute_type,
                         )
@@ -871,7 +880,7 @@ class WhisperXBackend(ASRBackend):
                     pass
                 self._device, self._compute_type = "cpu", "int8"
                 self._asr = whisperx.load_model(
-                    self._model_name,
+                    _local_model_source(self._model_name),
                     device=self._device,
                     compute_type=self._compute_type,
                 )
@@ -1173,7 +1182,7 @@ class FasterWhisperBackend(ASRBackend):
             for ct in candidates:
                 try:
                     self._model = WhisperModel(
-                        self._model_name, device=device, compute_type=ct
+                        _local_model_source(self._model_name), device=device, compute_type=ct
                     )
                     self._device, self._compute_type = device, ct
                     return
@@ -1356,7 +1365,7 @@ class MLXWhisperBackend(ASRBackend):
         audio = _decode_audio_16k_mono(audio_path)
         result = mlx_whisper.transcribe(
             audio,
-            path_or_hf_repo=self._model_name,
+            path_or_hf_repo=_local_model_source(self._model_name),
             word_timestamps=word_timestamps,
             **whisper_request_options(language, initial_prompt, temperature, task),
         )
@@ -1389,6 +1398,8 @@ class MLXWhisperBackend(ASRBackend):
         mlx_whisper internally caches via a class-level ModelHolder singleton.
         Calling ``load_model`` triggers the download (if needed) and loads
         weights onto the GPU — subsequent transcribe() calls hit the warm cache.
+        It must warm the same source ``transcribe`` passes: the singleton is
+        keyed by that string, and a repo id asks the Hub for ``main`` (#2583).
         """
         import time
         t0 = time.perf_counter()
@@ -1397,7 +1408,7 @@ class MLXWhisperBackend(ASRBackend):
             import mlx.core as mx
             # load_model populates the class-level singleton; after this call
             # the model is resident in unified memory.
-            ModelHolder.get_model(self._model_name, dtype=mx.float16)
+            ModelHolder.get_model(_local_model_source(self._model_name), dtype=mx.float16)
             dt = time.perf_counter() - t0
             logger.info("MLX Whisper model '%s' warmed up in %.1fs", self._model_name, dt)
         except Exception as e:
@@ -1553,7 +1564,7 @@ class PyTorchWhisperBackend(ASRBackend):
         try:
             self._pipe = hf_pipeline(
                 "automatic-speech-recognition",
-                model=model_name,
+                model=_local_model_source(model_name),
                 dtype=asr_dtype,
                 # `device_map="cpu"` only controls weight placement; the
                 # pipeline can still choose CUDA as its execution device.
@@ -1856,7 +1867,7 @@ class ParakeetMLXBackend(ASRBackend):
             return
         import parakeet_mlx
         logger.info("parakeet-mlx loading %s", self._model_name)
-        self._model = parakeet_mlx.from_pretrained(self._model_name)
+        self._model = parakeet_mlx.from_pretrained(_local_model_source(self._model_name))
 
     def ensure_loaded(self) -> None:
         self._ensure_model()
@@ -3069,6 +3080,85 @@ class ASRModelMissingError(RuntimeError):
         super().__init__(asr_model_missing_detail(payload))
 
 
+# ── Model licence acceptance (#2689) ───────────────────────────────────────
+# A model whose declared licence is not in the commercial category must be
+# accepted before use (services.model_acceptance). Every ASR / dictation
+# choke point resolves the concrete repo the backend instance will load and
+# checks it per use, so a revoked acceptance also applies to cached backends.
+# A sibling model of the same engine never decides the outcome.
+
+_MOONSHINE_REPOS = {
+    "moonshine/base": "UsefulSensors/moonshine-base",
+    "moonshine/tiny": "UsefulSensors/moonshine-tiny",
+}
+_HF_CACHE_DIR = re.compile(r"models--([^/\\]+?)--([^/\\]+)")
+
+
+_DRIVE_PATH = re.compile(r"[A-Za-z]:")
+
+
+def _licence_repo(name: str | None, *, faster_whisper: bool = False) -> str | None:
+    """HF repo id for a backend model name, alias, or installed snapshot path.
+
+    A local directory outside the HF cache has no registry identity (it is a
+    user-provided asset) and yields None. Local paths are recognised by syntax
+    (absolute, ``./``, ``../``, ``~``, drive letters), never by probing the
+    filesystem with a user-provided name.
+    """
+    name = str(name or "").strip()
+    if not name:
+        return None
+    cached = _HF_CACHE_DIR.search(name)
+    if cached:
+        return f"{cached.group(1)}/{cached.group(2)}"
+    if os.path.isabs(name) or name.startswith((".", "~")) or "\\" in name or _DRIVE_PATH.match(name):
+        return None
+    if name.lower() in _MOONSHINE_REPOS:
+        return _MOONSHINE_REPOS[name.lower()]
+    if faster_whisper:
+        return _fw_repo(name)
+    return name if "/" in name else None
+
+
+def backend_model_repos(backend: ASRBackend) -> list[str]:
+    """The concrete model repos ``backend`` loads (empty for remote engines)."""
+    if isinstance(backend, SherpaDictationBackend):
+        return [backend.spec.repo_id]
+    if isinstance(backend, PyTorchWhisperBackend):
+        repo = _licence_repo(backend._model_name())
+    else:
+        name = getattr(backend, "_model_name", None)
+        if isinstance(name, str):
+            repo = _licence_repo(
+                name,
+                faster_whisper=isinstance(backend, (FasterWhisperBackend, WhisperXBackend)),
+            )
+        else:
+            # Sidecar-isolated backends resolve their model in the child; the
+            # preflight helper mirrors that resolution exactly.
+            bid = getattr(backend, "id", None)
+            repo = _offline_asr_repo(bid) if bid else None
+    return [repo] if repo else []
+
+
+def ensure_backend_licence(backend: ASRBackend) -> None:
+    """Raise ``ModelLicenceNotAccepted`` before an unaccepted model is used."""
+    from services.model_acceptance import ensure_accepted
+
+    ensure_accepted(backend_model_repos(backend))
+
+
+def _licence_accepted(repo_id: str | None) -> bool:
+    """True when ``repo_id`` may be used now (accepted, or not gated)."""
+    from services.model_acceptance import ModelLicenceNotAccepted, ensure_accepted
+
+    try:
+        ensure_accepted([repo_id] if repo_id else [])
+    except ModelLicenceNotAccepted:
+        return False
+    return True
+
+
 def load_active_asr_backend(
     *, asr_pipe=None, require_installed: bool = False, defer_pytorch: bool = False,
 ) -> ASRBackend:
@@ -3102,6 +3192,9 @@ def load_active_asr_backend(
     tried: set[str] = set()
     while True:
         backend = get_active_asr_backend(asr_pipe=asr_pipe)
+        # Licence first, per use: a refused model surfaces its own typed error
+        # and is never swapped for a different model (#2689).
+        ensure_backend_licence(backend)
         if defer_pytorch and isinstance(backend, PyTorchWhisperBackend):
             return backend
         bid = getattr(backend, "id", "?")
@@ -3217,6 +3310,8 @@ def _installed_reference_fallbacks(
                     )
                     and _model_supported(model)
                     and model.get("repo_id") not in selected_repos
+                    # Never fall back onto an unaccepted gated model (#2689).
+                    and _licence_accepted(str(model.get("repo_id")))
                 ),
                 key=lambda model: float(model.get("size_gb") or 0),
                 reverse=True,
@@ -3252,6 +3347,7 @@ def _installed_reference_fallbacks(
                 for spec in sherpa_dictation.list_specs()
                 if spec.id not in selected_sherpa
                 and sherpa_dictation.is_installed(spec)
+                and _licence_accepted(spec.repo_id)
             ),
             key=lambda spec: float(spec.size_gb or 0),
             reverse=True,
@@ -3285,8 +3381,11 @@ def _release_reference_backend(backend: ASRBackend) -> None:
 def _try_reference_candidates(
     candidates: list[ASRBackend], audio_path: str, *, release_after: bool,
 ) -> str:
+    from services.model_acceptance import ModelLicenceNotAccepted
+
     for backend in candidates:
         try:
+            ensure_backend_licence(backend)
             result = backend.transcribe(audio_path, word_timestamps=False) or {}
             candidate_text = result.get("text") or " ".join(
                 (seg.get("text") or "").strip()
@@ -3295,6 +3394,8 @@ def _try_reference_candidates(
             candidate_text = (candidate_text or "").strip()
             if candidate_text:
                 return candidate_text
+        except ModelLicenceNotAccepted:
+            logger.info("transcribe_reference: %s skipped — model licence not accepted", backend.id)
         except Exception:  # noqa: BLE001 - try the next local engine
             logger.warning("transcribe_reference: %s failed", backend.id)
         finally:
@@ -3481,8 +3582,13 @@ def get_sherpa_dictation_backend(model_id: str) -> "SherpaDictationBackend":
     :func:`get_capture_asr_backend`. Thread-safe: the recognizer is shared;
     each session creates its own decode stream (see capture_ws)."""
     global _capture_backend, _capture_backend_key
+    from services import sherpa_dictation as _sd
+    from services.model_acceptance import ensure_accepted
     from services.performance_profiles import requested_tier
 
+    # Checked on every handout, cached or not, so revocation applies (#2689).
+    spec = _sd.get_spec(model_id)
+    ensure_accepted([spec.repo_id] if spec is not None else [])
     performance_tier = requested_tier("dictation")
     _touch_capture()  # any handout resets the idle clock
     with _capture_backend_lock:
@@ -3654,7 +3760,17 @@ def get_capture_asr_backend(*, skip_sherpa: bool = False) -> ASRBackend:
 
     ``skip_sherpa`` is used only to validate a token-silent Sherpa result with
     the installed capture fallback before persisting model demotion.
+
+    The selected model's licence is checked on every handout, including the
+    warm singleton, and an unaccepted model raises ``ModelLicenceNotAccepted``
+    instead of falling through to another engine (#2689).
     """
+    backend = _select_capture_asr_backend(skip_sherpa=skip_sherpa)
+    ensure_backend_licence(backend)
+    return backend
+
+
+def _select_capture_asr_backend(*, skip_sherpa: bool) -> ASRBackend:
     global _capture_backend, _capture_backend_key
 
     _touch_capture()  # any handout resets the idle clock (#1101 class)
@@ -3763,8 +3879,13 @@ def select_faster_whisper_model(repo_id: str) -> None:
     """Persist and apply a CTranslate2 model selection for this process."""
     from core import prefs
 
+    from services.model_acceptance import ensure_accepted
+
     if prefs.is_env_shadowed("ASR_MODEL_FASTER"):
         raise ValueError("ASR_MODEL_FASTER is set outside VoiceStudio")
+    # Selecting a gated model asks for acceptance up front; use is still
+    # checked at load, so a later revocation applies too (#2689).
+    ensure_accepted([_licence_repo(repo_id, faster_whisper=True)])
     prefs.set_("asr_model_faster", repo_id)
     # Sidecars inherit the process environment. Updating it here makes the
     # selection effective immediately as well as after the next app launch.
@@ -3791,6 +3912,29 @@ def _fw_repo(name: str) -> str | None:
     """HF repo for a faster-whisper/WhisperX model name (alias or repo id)."""
     name = (name or "").strip()
     return name if "/" in name else _FW_ALIAS_REPOS.get(name.lower())
+
+
+def _local_model_source(name: str) -> str:
+    """What an ASR backend should hand its loader: the installed snapshot
+    directory when ``name`` (repo id or faster-whisper alias) is installed,
+    otherwise ``name`` unchanged.
+
+    Loading by repo id asks the Hub for ``main`` first — an untimed request
+    that stalls on a packet-dropping network and cannot resolve a pinned
+    install offline — so profile saves and every other transcription hung or
+    failed without internet even though the weights were on disk (#2583).
+    A not-installed or custom name keeps its previous by-name behaviour.
+    """
+    if not name or os.path.isdir(name):
+        return name
+    repo = _fw_repo(name)
+    if repo is None:
+        return name
+    try:
+        from api.routers.setup.models import installed_snapshot_path
+        return installed_snapshot_path(repo) or name
+    except Exception:  # noqa: BLE001 — never block a load on the lookup
+        return name
 
 
 def _offline_asr_repo(backend_id: str | None = None) -> str | None:

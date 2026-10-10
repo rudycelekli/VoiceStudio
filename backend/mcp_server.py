@@ -282,6 +282,12 @@ async def _write_output(audio_id: str, raw: bytes, format: str = "wav") -> str:
 # client-side timeout (#2040).
 _BACKEND_GRACE_S = 30.0
 
+# Torch-free mirrors of the desktop backstop and model_manager's guard.
+# tests/test_generate_abort_budget.py keeps these in sync with their sources.
+_GENERATE_SIDECAR_FLOOR_S = 900.0
+_GENERATE_SIDECAR_GRACE_S = 5.0
+_GENERATE_PROGRESS_BUDGETS = 3.0
+
 
 def _env_seconds(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
@@ -312,11 +318,39 @@ def _backend_budget_s(kind: str, text: str = "") -> float | None:
             _env_seconds("OMNIVOICE_GENERATE_TIMEOUT_S", 300.0),
             _env_seconds("OMNIVOICE_CPU_GENERATE_TIMEOUT_S", 600.0),
         )
-        # As model_manager.generate_timeout_s: +1 s per 40 characters past 1200.
-        execution = base + max(0, len(text or "") - 1200) / 40.0
-        # A generation first waits in the GPU pool's queue, on its own clock
-        # (model_manager.GPU_QUEUE_TIMEOUT_S), before that budget starts.
-        return _env_seconds("OMNIVOICE_GPU_QUEUE_TIMEOUT_S", 1800.0) + execution
+        # Shared with the backend's rule (core.generate_budget): covers the
+        # legacy length bonus AND the automatic CPU ceiling (the backend budgets
+        # the NORMALIZED text, whose length this tool cannot see) — the tool
+        # must never give up before the backend does (#2609).
+        from core.generate_budget import client_execution_budget_s
+
+        execution = client_execution_budget_s(
+            max(base, _GENERATE_SIDECAR_FLOOR_S), len(text or ""),
+            cpu_auto_possible=not os.environ.get("OMNIVOICE_CPU_GENERATE_TIMEOUT_S", "").strip(),
+        ) + _GENERATE_SIDECAR_GRACE_S
+        # Classic /generate sends no response until the whole render finishes.
+        # Cold loading and queueing have separate clocks; fresh chunk-progress
+        # heartbeats can then extend execution by up to three more budgets.
+        # Waiting only for queue + execution cuts off healthy CPU renders.
+        model_load = max(30.0, _env_seconds("OMNIVOICE_MODEL_LOAD_TIMEOUT", 1200.0))
+        extension_cap = _env_seconds(
+            "OMNIVOICE_PROGRESS_EXTENSION_CAP_S",
+            _env_seconds("OMNIVOICE_MODEL_LOAD_TIMEOUT_S", 1800.0),
+        )
+        extension = max(extension_cap, _GENERATE_PROGRESS_BUDGETS * execution)
+        queue = _env_seconds("OMNIVOICE_GPU_QUEUE_TIMEOUT_S", 1800.0)
+        # A clone without a cached reference transcript first runs a separate
+        # guarded ASR job. That job uses generate_timeout_s("") without an
+        # engine: no length bonus or sidecar grace, but its own queue and
+        # progress extension. MCP cannot see whether the profile needs it.
+        reference = queue + base + max(extension_cap, _GENERATE_PROGRESS_BUDGETS * base)
+        return (
+            model_load
+            + reference
+            + queue
+            + execution
+            + extension
+        )
     return None
 
 
@@ -494,8 +528,8 @@ def create_mcp_server(app=None):
 
         FastMCP exposes the HTTP request via its request context on the
         Streamable-HTTP transport; stdio clients (and any version where the
-        accessor differs) simply resolve to None and fall back to the
-        global default voice."""
+        accessor differs) simply resolve to None and use the backend's
+        default voice."""
         try:
             req = mcp.get_context().request_context.request
             if req is not None:
@@ -522,7 +556,7 @@ def create_mcp_server(app=None):
                 supported. Omit to use the voice profile's saved language;
                 an explicit 'Auto' overrides it.
             profile_id: ID of a saved voice profile to clone. Omit to use this
-                agent's bound voice (Settings → MCP), else the global default.
+                agent's bound voice (Settings → MCP), else the default voice.
             instruct: Style instruction (e.g. 'whisper', 'excited', 'narrator').
             speed: Speech speed multiplier (0.5–2.0, default 1.0).
             steps: Diffusion steps (8=fast/draft, 16=balanced, 32=quality).
@@ -545,7 +579,7 @@ def create_mcp_server(app=None):
             if not await asyncio.to_thread(find_ffmpeg):
                 raise RuntimeError("Ogg/Opus file output requires local ffmpeg; install it or set FFMPEG_PATH")
         # Per-agent voice binding (Wave 2.2): explicit arg wins; otherwise
-        # resolve this client's bound profile, then the global default.
+        # resolve this client's bound profile.
         client_id = _current_client_id()
         try:
             from services import mcp_bindings
@@ -598,7 +632,7 @@ def create_mcp_server(app=None):
         and personality.
         """
         profiles = await _api_get("/profiles")
-        return str(profiles)
+        return json.dumps(profiles)
 
     @mcp.tool()
     async def list_personalities() -> str:
@@ -608,7 +642,7 @@ def create_mcp_server(app=None):
         instruct text. Use the instruct text with generate_speech.
         """
         presets = await _api_get("/personalities")
-        return str(presets)
+        return json.dumps(presets)
 
     @mcp.tool()
     async def list_languages() -> str:
@@ -660,13 +694,13 @@ def create_mcp_server(app=None):
                              "application/octet-stream")},
             timeout=_post_timeout_s("transcribe"),
         )
-        return str(r.json())
+        return json.dumps(r.json())
 
     @mcp.tool()
     async def check_health() -> str:
         """Check if the VoiceStudio backend is running and what GPU device is active."""
         info = await _api_get("/health")
-        return str(info)
+        return json.dumps(info)
 
     # ── Resources ───────────────────────────────────────────────────────
 
@@ -676,14 +710,14 @@ def create_mcp_server(app=None):
         profiles = await _api_get("/profiles")
         for p in profiles:
             if p.get("id") == profile_id:
-                return str(p)
-        return f'{{"error":"Voice profile {profile_id} not found"}}'
+                return json.dumps(p)
+        return json.dumps({"error": f"Voice profile {profile_id} not found"})
 
     @mcp.resource("history://recent")
     async def get_recent_history() -> str:
         """Get the 20 most recent generation history items."""
         history = await _api_get("/history")
-        return str(history[:20])
+        return json.dumps(history[:20])
 
     @mcp.tool()
     async def clone_voice(

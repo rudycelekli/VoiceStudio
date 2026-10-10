@@ -1,7 +1,14 @@
+import { generateAbortMs } from '@shared/utils/generateBudget';
 import { generationFailureMessage } from '@shared/utils/generationFailureMessage.ts';
 import i18next from 'i18next';
 import { languageRejectionMessage } from '@shared/utils/languageRejection.ts';
+import { announceModelLicenceRequired } from '@/features/settings/model-license-contract';
 import { ApiError, apiFetch, isAbortError } from './client';
+import {
+  generateBudgetPending,
+  generateBudgetSettled,
+  reportedGenerateBudget,
+} from './generate-budget';
 import type { CloneGenerateInput, GenerateResult } from './types';
 import { beginAppActivity } from '@/lib/app-activity';
 import { createStreamingPreview } from '@/lib/audio/streaming-preview';
@@ -13,13 +20,6 @@ export const CLONE_MAX_SECONDS = 15;
  * windows (omnivoice/utils/audio.py CLONE_REF_MAX_WINDOWS) — rejected outright.
  */
 export const REF_HARD_MAX_SECONDS = 75;
-/**
- * Client-side abort backstop. The first /generate may cold-load the model;
- * the backend bounds that itself and returns a descriptive error, so this sits
- * just above its load timeout to make sure the UI never spins forever if the
- * backend goes silent.
- */
-export const GENERATE_ABORT_MS = 21 * 60 * 1000;
 
 // ── Instruct whitelist ─────────────────────────────────────────────────────
 // The engine validator (omnivoice/models/omnivoice.py::_resolve_instruct)
@@ -329,6 +329,7 @@ export async function generateCloneStreaming(
       } else if (event.type === 'done') {
         meta = event;
       } else if (event.type === 'error') {
+        announceModelLicenceRequired(event);
         const message =
           languageRejectionMessage(event, i18next.t) ||
           generationFailureMessage(event, i18next.t) ||
@@ -407,7 +408,14 @@ export async function generateClone(
   const forwardAbort = (): void => controller.abort();
   if (opts.signal?.aborted) controller.abort();
   else opts.signal?.addEventListener('abort', forwardAbort, { once: true });
-  const backstop = setTimeout(forwardAbort, GENERATE_ABORT_MS);
+  // Outlasts the backend's own budget so its descriptive error always wins. A
+  // budget read still in flight (just after connecting) is awaited briefly so
+  // an operator-raised timeout is not missed.
+  if (generateBudgetPending()) await generateBudgetSettled(2_000);
+  const backstop = setTimeout(
+    forwardAbort,
+    generateAbortMs(input.text.length, reportedGenerateBudget()),
+  );
   const finishActivity = beginAppActivity('synthesis');
   try {
     const res = await apiFetch('/generate', {

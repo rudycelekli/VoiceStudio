@@ -114,6 +114,78 @@ def _next_counter(db_path: str, safe_version: str) -> int:
     return highest + 1
 
 
+def _reserve_snapshot(db_path: str, safe_version: str) -> tuple[str, str]:
+    """Claim a counter atomically across threads/processes before copying.
+
+    Reservations are not backup files. An abandoned reservation consumes one
+    counter but never gets offered as recovery data or overwritten by a retry.
+    """
+    counter = _next_counter(db_path, safe_version)
+    while True:
+        target = f"{db_path}.backup-{safe_version}-{counter}"
+        reservation = target + ".reserve"
+        try:
+            fd = os.open(reservation, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            counter += 1
+            continue
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii"))  # ownership for stale_reservations
+        finally:
+            os.close(fd)
+        if os.path.exists(target):
+            os.unlink(reservation)
+            counter += 1
+            continue
+        return target, reservation
+
+
+#: Fallback only for a reservation whose owner PID was never recorded (a writer
+#: that died between creating the file and writing its PID).
+_RESERVATION_MAX_AGE_S = 24 * 3600
+
+
+def _reservation_owner(path: str) -> int | None:
+    try:
+        with open(path, "r", encoding="ascii") as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def stale_reservations(db_path: str) -> list[str]:
+    """``.reserve`` markers whose writer is confirmed gone.
+
+    A reservation owned by a live process (including this one, other threads)
+    is never listed, however old: a snapshot can outlive a long suspend, and
+    removing its marker would let another startup claim the same counter.
+    ``_pid_alive`` errs toward "alive". Only a marker with no recorded owner
+    falls back to an age check."""
+    directory = os.path.dirname(os.path.abspath(db_path)) or "."
+    base = os.path.basename(db_path)
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    stale = []
+    now = time.time()
+    for name in names:
+        if not (name.startswith(base + ".backup-") and name.endswith(".reserve")):
+            continue
+        if not _BACKUP_SUFFIX_RE.fullmatch(name[: -len(".reserve")][len(base):]):
+            continue
+        path = os.path.join(directory, name)
+        owner = _reservation_owner(path)
+        if owner is not None:
+            if owner == os.getpid() or _pid_alive(owner):
+                continue
+            stale.append(path)
+        elif now - _mtime(path) > _RESERVATION_MAX_AGE_S:
+            stale.append(path)
+    return stale
+
+
 def stale_partial_backups(db_path: str) -> list[str]:
     """``<db>.backup-<version>-<n>.part-<pid>`` files whose writer is gone.
 
@@ -158,13 +230,13 @@ def prune_backups(db_path: str, keep: int = KEEP_BACKUPS) -> list[str]:
     """Delete all but the ``keep`` newest backups, plus torn partial
     snapshots from earlier runs. Returns deleted paths."""
     deleted = []
-    for path in stale_partial_backups(db_path):
+    for path in stale_partial_backups(db_path) + stale_reservations(db_path):
         try:
             os.remove(path)
             deleted.append(path)
-            logger.info("Removed torn partial DB backup %s", path)
+            logger.info("Removed stale DB backup leftover %s", path)
         except OSError as exc:
-            logger.warning("Could not remove partial DB backup %s: %s", path, exc)
+            logger.warning("Could not remove DB backup leftover %s: %s", path, exc)
     for path in list_backups(db_path)[keep:]:
         try:
             os.remove(path)
@@ -195,32 +267,38 @@ def snapshot_before_migration(db_path: str, version: str) -> str | None:
         return None
 
     safe_version = _sanitize_version(version)
-    target = f"{db_path}.backup-{safe_version}-{_next_counter(db_path, safe_version)}"
+    target, reservation = _reserve_snapshot(db_path, safe_version)
     tmp = f"{target}.part-{os.getpid()}"
-    src = sqlite3.connect(db_path)
     try:
-        dst = sqlite3.connect(tmp)
+        src = sqlite3.connect(db_path)
         try:
-            # Online backup: consistent snapshot including WAL contents.
-            src.backup(dst)
-            dst.commit()
+            dst = sqlite3.connect(tmp)
+            try:
+                # Online backup: consistent snapshot including WAL contents.
+                src.backup(dst)
+                dst.commit()
+            finally:
+                dst.close()
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass  # best effort: the torn temp is pruned later; the backup error below matters more
+            raise
         finally:
-            dst.close()
-    except BaseException:
+            src.close()
+        os.replace(tmp, target)
+        # A same-second rotation must still rank the new file newest.
         try:
-            os.remove(tmp)
+            now = time.time()
+            os.utime(target, (now, now))
         except OSError:
-            pass
-        raise
+            pass  # ordering hint only; the snapshot itself is already in place
+        logger.info("Pre-migration DB backup written: %s (%.1f MB)", target, size / (1024 * 1024))
+        prune_backups(db_path)
+        return target
     finally:
-        src.close()
-    os.replace(tmp, target)
-    # A same-second rotation must still rank the new file newest.
-    try:
-        now = time.time()
-        os.utime(target, (now, now))
-    except OSError:
-        pass
-    logger.info("Pre-migration DB backup written: %s (%.1f MB)", target, size / (1024 * 1024))
-    prune_backups(db_path)
-    return target
+        try:
+            os.unlink(reservation)
+        except OSError:
+            pass  # marker already gone; pruning handles any leftover

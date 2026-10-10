@@ -1,14 +1,12 @@
 import i18next from 'i18next';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import {
-  _resetBackendContactForTests,
-  lastBackendContact,
-} from '@shared/utils/backendContact';
+import { _resetBackendContactForTests, lastBackendContact } from '@shared/utils/backendContact';
 import {
   ApiError,
   apiFetch,
   apiJson,
   audioUrl,
+  ENGINE_SELECTED_EVENT,
   describeError,
   errorFromResponse,
   profileAudioUrl,
@@ -35,6 +33,26 @@ describe('errorFromResponse', () => {
     expect(err.detail).toBe('Localized recovery guidance');
     expect(translate).toHaveBeenCalledWith('engines.argosRuntimeUnavailable');
     expect(err.payload?.detail).toEqual(detail);
+  });
+  it('announces unaccepted model licences so the app can ask for acceptance', async () => {
+    const translate = vi.spyOn(i18next, 't').mockReturnValue('Accept the licence first');
+    const models = [
+      { repo_id: 'a/b', category: 'noncommercial', fingerprint: `v1:${'a'.repeat(64)}` },
+    ];
+    const detail = { code: 'model_licence_required', message: 'raw', models };
+    const seen: unknown[] = [];
+    const listener = (event: Event) => seen.push((event as CustomEvent).detail);
+    window.addEventListener('ov:model-licence-required', listener);
+    try {
+      const err = await errorFromResponse(
+        new Response(JSON.stringify({ detail }), { status: 403 }),
+      );
+      expect(err.detail).toBe('Accept the licence first');
+      expect(translate).toHaveBeenCalledWith('modelLicense.requiredError');
+      expect(seen).toEqual([models]);
+    } finally {
+      window.removeEventListener('ov:model-licence-required', listener);
+    }
   });
   it('localizes background preservation errors and retains diagnostics', async () => {
     const detail = { code: 'dub_background_unavailable', message: 'Raw diagnostic' };
@@ -277,4 +295,24 @@ it('shows top-level API recovery errors without exposing raw JSON', async () => 
   const error = await errorFromResponse(new Response(JSON.stringify(payload), { status: 400 }));
   expect(error.message).toBe(payload.error);
   expect(error.payload).toEqual(payload);
+});
+
+describe('engine selection event', () => {
+  it('fires after a successful POST /engines/select only', async () => {
+    vi.stubGlobal('fetch', async () => new Response('{}', { status: 200 }));
+    const seen = vi.fn();
+    window.addEventListener(ENGINE_SELECTED_EVENT, seen);
+    try {
+      await apiFetch('/engines/select');
+      await apiFetch('/engines/select', { method: 'GET' });
+      expect(seen).not.toHaveBeenCalled();
+      await apiFetch('/engines/select', { method: 'POST', body: '{}' });
+      expect(seen).toHaveBeenCalledTimes(1);
+      vi.stubGlobal('fetch', async () => new Response('{}', { status: 500 }));
+      await apiFetch('/engines/select', { method: 'POST', body: '{}' }).catch(() => {});
+      expect(seen).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener(ENGINE_SELECTED_EVENT, seen);
+    }
+  });
 });

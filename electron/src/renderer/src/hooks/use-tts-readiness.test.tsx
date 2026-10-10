@@ -15,9 +15,13 @@ const state = vi.hoisted(() => ({
   computeTargetCalls: [] as Array<[boolean, string]>,
 }));
 
-vi.mock('./use-backend-status', () => ({
-  useBackendStatus: () => ({ stage: state.backendStage }),
-}));
+vi.mock('./use-backend-status', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./use-backend-status')>();
+  return {
+    ...actual,
+    useBackendStatus: () => ({ stage: state.backendStage }),
+  };
+});
 
 vi.mock('./use-engines', () => ({
   engineFamilyState: (data: Record<string, unknown> | undefined, family: string) => data?.[family],
@@ -151,5 +155,23 @@ describe('target-aware TTS readiness', () => {
 
     expect(renderHook(() => useTtsReadiness('clone')).result.current).toBeNull();
     expect(state.computeTargetCalls).toContainEqual([true, 'clone']);
+  });
+
+  // #2430: a busy backend is mid-job, not a loading state. Reporting
+  // 'loading' here left the workspace visible with every generation control
+  // disabled for the whole length of a long generation.
+  it('keeps generation available while a live backend is only busy', () => {
+    state.backendStage = 'unresponsive';
+    state.localReady = true;
+
+    expect(renderHook(() => useTtsReadiness()).result.current).toBeNull();
+    expect(state.computeTargetCalls).toContainEqual([true, 'tts']);
+  });
+
+  it('still blocks generation when the backend is terminally gone', () => {
+    state.backendStage = 'crashed';
+    state.localReady = true;
+
+    expect(renderHook(() => useTtsReadiness()).result.current).toBe('loading');
   });
 });

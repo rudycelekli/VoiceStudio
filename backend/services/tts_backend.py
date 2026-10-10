@@ -249,7 +249,11 @@ class TTSBackend(ABC):
 
     #: Whether this engine supports voice design from a text description
     #: (e.g. "young female, warm tone, British accent") without reference audio.
-    supports_voice_design: bool = False
+    #: ``False`` engines need a reference clip for the timbre, so Voice Design
+    #: is refused up front (UI and ``/generate``) instead of failing inside the
+    #: engine. ``None`` = not declared: design stays allowed and the engine
+    #: decides. Read through :func:`voice_design_support`.
+    supports_voice_design: Optional[bool] = None
 
     #: Whether this engine understands the graded-emotion generate kwargs
     #: (``emo_vector`` / ``emo_text`` + ``use_emo_text`` / ``emo_alpha``).
@@ -812,8 +816,13 @@ def _reference_duration_cached(path: str, _mtime_ns: int, _size: int) -> Optiona
     except Exception:  # noqa: BLE001 — fall through to ffmpeg
         pass
     try:
+        from core.url_safety import is_manifest_file
         from pydub import AudioSegment
 
+        # pydub's ffmpeg call cannot take input options, so a playlist named
+        # like audio is refused here rather than given to ffmpeg to follow.
+        if is_manifest_file(path):
+            return None
         return float(AudioSegment.from_file(path).duration_seconds)
     except Exception:  # noqa: BLE001 — unknown length: callers keep old behavior
         return None
@@ -1074,8 +1083,11 @@ def _read_reference_mono(path: str):
     if audio is None:
         try:
             import numpy as np
+            from core.url_safety import is_manifest_file
             from pydub import AudioSegment
 
+            if is_manifest_file(path):  # never hand a playlist to ffmpeg
+                return None
             segment = AudioSegment.from_file(path)
             sr = int(segment.frame_rate)
             samples = np.array(segment.get_array_of_samples(), dtype=np.float32)
@@ -1217,6 +1229,27 @@ def _reuse_or_rank_passage(ref_audio: str) -> Optional[tuple[str, str]]:
             if path is not None:
                 return path, recalled[1]
     return _omnivoice_installed_passage(ref_audio)
+
+
+def omnivoice_inline_reference(ref_audio, ref_text):
+    """``(ref_audio, ref_text, owned_path)`` for a direct ``model.generate()``.
+
+    Paths that bypass the prompt cache — the sidecar request and the inline
+    retry after a failed precompute — must condition on the same installed-
+    recognizer passage as the cache. Passing the whole long clip with no
+    transcript instead reached OmniVoice's bundled Whisper and failed with
+    "needs an installed speech-to-text model" although one was installed
+    (#2579). ``owned_path`` is a temporary window the caller deletes.
+    """
+    if isinstance(ref_audio, str):
+        from omnivoice.utils.audio import CLONE_REF_TEXT_MAX_SECONDS
+
+        duration = reference_duration_s(ref_audio)
+        if duration is not None and duration > CLONE_REF_TEXT_MAX_SECONDS:
+            selected = _reuse_or_rank_passage(ref_audio)
+            if selected is not None:
+                return selected[0], selected[1], selected[0]
+    return ref_audio, omnivoice_ref_text(ref_audio, ref_text), None
 
 
 def _speech_score(text: str) -> int:
@@ -1406,7 +1439,11 @@ def generate_with_cached_ref(model, *, ref_audio, ref_text, **gen_kw):
     # look the cache up, but never insert — see _get_clone_prompt(store=). MUST
     # be popped: the model's generate() has an explicit signature and would
     # TypeError on an unknown kwarg.
-    with engine_in_use(OmniVoiceBackend(model=model)):
+    from services.model_manager import tts_inference
+
+    # tts_inference: no device move of the shared model while this runs, and
+    # it is restored first if an offload left it in RAM (#2618).
+    with engine_in_use(OmniVoiceBackend(model=model)), tts_inference():
         cache_ref = bool(gen_kw.pop("cache_ref", True))
         # Stays in gen_kw too: the model needs it on the inline branch, and it is inert
         # on the prompt branch (that prompt is already encoded).
@@ -1420,9 +1457,15 @@ def generate_with_cached_ref(model, *, ref_audio, ref_text, **gen_kw):
                 return model.generate(voice_clone_prompt=prompt, **gen_kw)
             except Exception as e:  # noqa: BLE001 — fall back to the inline ref
                 logger.warning("voice_clone_prompt generate failed; retrying inline ref: %s", e)
-        return model.generate(
-            ref_audio=ref_audio, ref_text=omnivoice_ref_text(ref_audio, ref_text), **gen_kw
-        )
+        inline_audio, inline_text, passage = omnivoice_inline_reference(ref_audio, ref_text)
+        try:
+            return model.generate(ref_audio=inline_audio, ref_text=inline_text, **gen_kw)
+        finally:
+            if passage is not None:
+                try:
+                    os.remove(passage)
+                except OSError:
+                    logger.debug("failed to remove reference window")
 
 
 def clear_clone_prompt_cache() -> None:
@@ -1451,6 +1494,7 @@ class OmniVoiceBackend(TTSBackend):
     id = "omnivoice"
     display_name = "VoiceStudio (k2-fsa/OmniVoice, 600+ languages)"
     instruct_vocabulary = "tags"
+    supports_voice_design = True
     gpu_compat = ("cuda", "rocm", "mps", "cpu")
     # Derived from the pool's own per-job budget (_GPU_VRAM_PER_JOB_GB = 5.0 in
     # model_manager, itself measured from the ~1.6 GB forward + autoregressive
@@ -1515,6 +1559,13 @@ class OmniVoiceBackend(TTSBackend):
 
     def _ensure_loaded(self):
         if self._model is not None:
+            # The cached instance skips get_model(), and with it the placement
+            # heal: put the shared model back on its device if the opt-in
+            # post-generation offload (#2618) or an unbalanced ASR offload
+            # (#1191) left it in RAM. One parameter probe when it is in place.
+            from services.model_manager import ensure_tts_on_device
+
+            ensure_tts_on_device()
             return
         # Reuse model_manager's cached instance so we don't double-load.
         from services.model_manager import get_model
@@ -1575,7 +1626,14 @@ class OmniVoiceBackend(TTSBackend):
         self._ensure_loaded()
         if not texts:
             return []
+        from services.model_manager import tts_inference
 
+        # Holds the shared model in place for prompt encoding + the batch
+        # generate (an offload can't move it mid-batch; #2618).
+        with tts_inference():
+            return self._generate_batch_on_model(texts, **kw)
+
+    def _generate_batch_on_model(self, texts: list[str], **kw) -> list[torch.Tensor]:
         def _items(value):
             if isinstance(value, list):
                 return value
@@ -1983,6 +2041,7 @@ class MossTTSNanoBackend(TTSBackend):
 
     id = "moss-tts-nano"
     display_name = "MOSS-TTS-Nano (20 langs, CPU realtime, 48 kHz)"
+    supports_voice_design = False  # strictly reference-cloning
     gpu_compat = ("cuda", "cpu")
 
     def __init__(self):
@@ -2960,6 +3019,7 @@ class GPTSoVITSBackend(TTSBackend):
 
     id = "gpt-sovits"
     display_name = "GPT-SoVITS (5 langs, zero-shot, RTF 0.014, MIT)"
+    supports_voice_design = False  # api_v2 needs a reference clip for every request
     # Server-side; whichever device GPT-SoVITS itself uses (CUDA preferred).
     gpu_compat = ("cuda", "cpu")
 
@@ -3485,6 +3545,13 @@ def _sidecar_installable_ids() -> frozenset[str]:
         return frozenset()
 
 
+def voice_design_support(cls) -> Optional[bool]:
+    """``supports_voice_design`` as reported to clients: a declared bool, or
+    None when the engine never declared it (or it depends on the model)."""
+    value = getattr(cls, "supports_voice_design", None)
+    return value if isinstance(value, bool) else None
+
+
 def list_backends(*, include_hidden: bool = False) -> list[dict]:
     """Enumerate the engine catalogue with each backend's availability state.
 
@@ -3515,6 +3582,8 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
           "supports_cloning": Optional[bool],       # True/False from the class attr; None when
                                                     #   model-dependent (property, e.g. mlx-audio)
           "instruct_vocabulary": "tags" | "freeform",  # OmniVoice tag set vs model-native text
+          "supports_voice_design": Optional[bool],  # False = needs a reference clip;
+                                                    #   None = undeclared (design allowed)
           "max_ref_seconds": Optional[float],       # seconds of a clone clip the engine uses
           "ref_strategy": Optional[str],            # "best_window" | "head" | "full"; None = unverified
           "effective_device": str,                  # device this engine uses on THIS host
@@ -3641,6 +3710,8 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
             # "tags" = OmniVoice's closed design vocabulary; "freeform" = the
             # text reaches the model as written (#2389).
             "instruct_vocabulary": getattr(cls, "instruct_vocabulary", "freeform"),
+            # Voice Design gate: False hides Design for reference-only engines.
+            "supports_voice_design": voice_design_support(cls),
             # Reference-length truth (#2281): how much of a clone clip the
             # engine really uses and how it picks it. None = not verified.
             "max_ref_seconds": getattr(cls, "max_ref_seconds", None),
@@ -4004,6 +4075,38 @@ def reset_active_backend() -> None:
                            type(inst).__name__, exc)
 
 
+def ensure_engine_licence(cls) -> None:
+    """Refuse a TTS engine whose gated model licences the user has not accepted.
+
+    Checked on every resolution, not only at construction, so revoking
+    acceptance also stops an already-cached instance. Raises
+    ``ModelLicenceNotAccepted`` before any weights load or sidecar starts.
+    """
+    from services.model_acceptance import ensure_engine_accepted
+
+    engine_id = getattr(cls, "id", None)
+    if not engine_id:
+        return
+    try:
+        identity = cls.configured_identity()
+    except Exception:  # noqa: BLE001 — unknown model: gate every model the engine ships
+        identity = None
+    ensure_engine_accepted(engine_id, identity)
+
+
+def ensure_active_engine_licence() -> None:
+    """:func:`ensure_engine_licence` for the configured engine, before any routing.
+
+    For job entry points that may render remotely and so never reach the local
+    instance cache. An unknown engine id is left to the caller's own error.
+    """
+    try:
+        cls = get_backend_class(active_backend_id())
+    except ValueError:
+        return
+    ensure_engine_licence(cls)
+
+
 def get_active_tts_backend(*, model=None) -> TTSBackend:
     """Return the configured backend, reusing a cached instance and releasing
     the previous engine on a switch (MM2-01).
@@ -4021,6 +4124,9 @@ def get_active_tts_backend(*, model=None) -> TTSBackend:
     """
     global _active_instance, _active_instance_id, _active_mlx_model_key
     bid = active_backend_id()
+    cls = get_backend_class(bid)
+    # Before the switch below: a refused engine must not unload the working one.
+    ensure_engine_licence(cls)
 
     mlx_model_key = None
     if bid == "mlx-audio":
@@ -4048,7 +4154,6 @@ def get_active_tts_backend(*, model=None) -> TTSBackend:
         _active_instance_id = None
         _active_mlx_model_key = None
 
-    cls = get_backend_class(bid)
     if cls is OmniVoiceBackend and model is not None:
         # Per-call view over the already-loaded shared singleton; don't cache it
         # (the model lifecycle is owned by model_manager), but the switch above
@@ -4169,6 +4274,7 @@ def get_engine_instance(cls, *, now: Optional[float] = None):
     an extra sidecar process the first time the lock is acquired. One instance
     per process is the right move.
     """
+    ensure_engine_licence(cls)
     stale = None
     with _ENGINE_CACHE_LOCK:
         inst = _ENGINE_INSTANCES.get(cls)
@@ -4295,6 +4401,7 @@ async def resolve_generation_backend(
             "Check Model Catalogue or the OMNIVOICE_TTS_BACKEND env var."
         ) from e
 
+    ensure_engine_licence(backend_cls)
     try:
         ok, msg = backend_cls.is_available()
     except Exception as exc:  # noqa: BLE001 — surface as an actionable ValueError
