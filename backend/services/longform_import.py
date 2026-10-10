@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import io
 import logging
+import lzma
 import posixpath
 import re
 import zipfile
+import zlib
 from html.parser import HTMLParser
 from xml.etree import ElementTree as ET
 from urllib.parse import unquote, urlsplit
@@ -477,7 +479,8 @@ def _read_member(zf: zipfile.ZipFile, name: str, budget: _ReadBudget, *, require
         return None
     try:
         raw = zf.read(name)
-    except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError) as e:
+    except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError,
+            OSError, zlib.error, lzma.LZMAError) as e:
         raise ValueError(f"EPUB member {name!r} is unreadable: {e}") from e
     budget.used += len(raw)
     return raw
