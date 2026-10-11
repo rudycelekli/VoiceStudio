@@ -199,6 +199,16 @@ def test_tailscale_enable_failure_keeps_service_output_private(monkeypatch, capl
 
 def test_tailscale_command_exception_stays_in_local_log(monkeypatch, caplog):
     from services import tailscale
+    from core.logging_filter import REDACTED, install_redaction_filter
+
+    # Exercise configured logging without depending on another test importing
+    # main, and restore pytest's shared capture handler after this test.
+    logger = logging.Logger("owned.tailscale", level=logging.ERROR)
+    logger.handlers = [caplog.handler]
+    monkeypatch.setattr(tailscale, "logger", logger)
+    monkeypatch.setattr(caplog.handler, "formatter", caplog.handler.formatter)
+    monkeypatch.setattr(caplog.handler, "filters", list(caplog.handler.filters))
+    install_redaction_filter(logger)
 
     private = f"{_PRIVATE}\nTOKEN=private-value"
 
@@ -210,7 +220,9 @@ def test_tailscale_command_exception_stays_in_local_log(monkeypatch, caplog):
         result = tailscale._run(["tailscale", "serve"])
 
     assert result == {"ok": False, "error": "tailscale command failed"}
-    assert private in caplog.text
+    synthetic_token = "hf_" + "abcdefghijklmnopqrstuvwxyz" + "1234567890"
+    assert private.replace(synthetic_token, REDACTED) in caplog.text
+    assert synthetic_token not in caplog.text
     assert private not in str(result)
 
 
