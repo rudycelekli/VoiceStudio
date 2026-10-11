@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 
-@pytest.mark.parametrize('kind', ['factory', 'streaming', 'ffmpeg'])
-def test_failed_caller_cleanup_keeps_process_available_to_next_abort(kind):
+@pytest.mark.parametrize('kind,platform', [('factory', 'darwin'), ('streaming', 'darwin'), ('ffmpeg', 'darwin'), ('ffmpeg', 'win32')])
+def test_failed_caller_cleanup_keeps_process_available_to_next_abort(kind, platform):
     from services import proc_registry as registry
 
     tree = ast.parse((Path(__file__).parents[1] / 'backend/services/dub_pipeline.py').read_text())
@@ -17,7 +17,7 @@ def test_failed_caller_cleanup_keeps_process_available_to_next_abort(kind):
         tree = ast.parse((Path(__file__).parents[1] / 'backend/services/ffmpeg_utils.py').read_text())
         name = 'run_ffmpeg'
     definition = next(node for node in tree.body if getattr(node, 'name', None) == name)
-    jid = f'cleanup-retry-{kind}'
+    jid = f'cleanup-retry-{kind}-{platform}'
 
     class Process:
         returncode = None
@@ -48,8 +48,9 @@ def test_failed_caller_cleanup_keeps_process_available_to_next_abort(kind):
         'register_proc': registry.register_proc, 'unregister_proc': registry.unregister_proc,
         'AsyncIterator': object,
         'local_inputs_only': lambda cmd, **kwargs: cmd,
+        'externalize_long_filter_complex': lambda cmd: (cmd, None),
         '_media_tool_kind': lambda cmd: 'ffmpeg',
-        'sys': __import__('sys'), 'os': __import__('os'),
+        'sys': SimpleNamespace(platform=platform), 'os': __import__('os'),
         'logger': __import__('logging').getLogger('owned-proc-test'),
     }
     module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0), definition], type_ignores=[])
