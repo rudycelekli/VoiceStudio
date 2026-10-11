@@ -272,6 +272,17 @@ def snapshot_before_migration(db_path: str, version: str) -> str | None:
     try:
         src = sqlite3.connect(db_path)
         try:
+            # The main file excludes committed pages still in the WAL. The
+            # online backup copies the logical database, not WAL frame history.
+            page_count = src.execute("PRAGMA page_count").fetchone()[0]
+            page_size = src.execute("PRAGMA page_size").fetchone()[0]
+            size = max(size, page_count * page_size)
+            if size > MAX_BACKUP_DB_BYTES:
+                logger.info(
+                    "Skipping pre-migration DB backup: %s is %.0f MB (> %.0f MB limit)",
+                    db_path, size / (1024 * 1024), MAX_BACKUP_DB_BYTES / (1024 * 1024),
+                )
+                return None
             dst = sqlite3.connect(tmp)
             try:
                 # Online backup: consistent snapshot including WAL contents.
