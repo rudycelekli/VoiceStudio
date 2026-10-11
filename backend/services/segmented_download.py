@@ -190,6 +190,10 @@ async def segmented_download(
                         async for chunk in r.aiter_bytes(_READ_CHUNK):
                             if _cancelled():
                                 raise DownloadCancelled()
+                            if len(chunk) > want - got:
+                                raise ValueError(
+                                    f"segment {start}-{end} overlong read: got more than {want} bytes"
+                                )
                             fh.write(chunk)
                             got += len(chunk)
                             if on_bytes:

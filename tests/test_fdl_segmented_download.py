@@ -284,3 +284,29 @@ def test_segment_http_error_stops_other_segments(tmp_path):
         return [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
 
     assert asyncio.run(_do()) == []
+
+
+@pytest.mark.parametrize("read_chunk", [2, 1024])
+def test_overlong_range_cannot_corrupt_completed_neighbor(tmp_path, monkeypatch, read_chunk):
+    monkeypatch.setattr(sd, "_MIN_SEGMENT_BYTES", 4)
+    monkeypatch.setattr(sd, "_MAX_SEGMENT_BYTES", 4)
+    monkeypatch.setattr(sd, "_READ_CHUNK", read_chunk)
+    payload = b"ABCDEFGH"
+    dest = str(tmp_path / "model.bin")
+    with open(dest + ".part", "wb") as handle:
+        handle.write(b"0000" + payload[4:])
+    sd._save_done(dest + ".part", len(payload), {(4, 7)})
+
+    def overlong(request):
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"content-length": "8", "accept-ranges": "bytes"})
+        assert request.headers["range"] == "bytes=0-3"
+        return httpx.Response(206, headers={"content-range": "bytes 0-3/8"}, content=b"ABCDxx")
+
+    with pytest.raises(ValueError):
+        _download(overlong, dest, expected_size=len(payload), num_connections=2)
+    with open(dest + ".part", "rb") as handle:
+        assert handle.read()[4:] == payload[4:]
+    _download(_ranged_handler(payload), dest, expected_size=len(payload), num_connections=2)
+    with open(dest, "rb") as handle:
+        assert handle.read() == payload
