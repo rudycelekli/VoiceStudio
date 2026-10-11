@@ -317,6 +317,7 @@ if _json_logs:
     # Replace every existing handler's formatter with the JSON one.
     for _h in logging.getLogger().handlers:
         _h.setFormatter(_JsonFormatter())
+    install_redaction_filter()
 
 # Rolling file handler so the Settings UI > Logs > Backend tab has something to read.
 # Attached to root so uvicorn, fastapi, and every `omnivoice.*` namespace land here.
