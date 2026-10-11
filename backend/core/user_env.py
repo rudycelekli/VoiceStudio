@@ -64,6 +64,8 @@ def _write_lines(path: str, lines: list[str]) -> None:
         try:
             os.unlink(temporary)
         except OSError:
+            # Successful replacement already removed this path; cleanup failures
+            # must not mask the original write or replacement exception.
             pass
     try:
         os.chmod(path, 0o600)  # tighten an existing file that predates the opener
