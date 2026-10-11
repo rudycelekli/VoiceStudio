@@ -1601,5 +1601,77 @@
         ]
       }
     ]
+  },
+  {
+    "name": "ssml_spell_grapheme_combining",
+    "input": "[spell]éA[/spell]",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "é A",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ssml_spell_grapheme_indic",
+    "input": "[spell]क्‍षA[/spell]",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "क्‍ष A",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ssml_spell_grapheme_flag",
+    "input": "[spell]🇺🇸A[/spell]",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "🇺🇸 A",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ssml_spell_grapheme_emoji",
+    "input": "[spell]👩🏽‍💻A[/spell]",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "👩🏽‍💻 A",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
   }
 ]
