@@ -735,7 +735,7 @@ def test_featured_tarball_is_byte_deterministic(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("checked_at", ["invalid", [], {}, float("nan"), float("inf"), 10 ** 400])
+@pytest.mark.parametrize("checked_at", ["invalid", [], {}, False, True, float("nan"), float("inf"), 10 ** 400])
 async def test_malformed_gallery_timestamp_recovers_without_losing_consent(sandbox, stub, checked_at):
     gallery._save_state({"enabled": True, "last_checked": checked_at})
     state = gallery.load_state()

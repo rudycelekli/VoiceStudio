@@ -171,7 +171,7 @@ def load_state() -> dict:
             checked = state.get("last_checked")
             if checked is not None:
                 try:
-                    valid = isinstance(checked, (int, float)) and math.isfinite(checked)
+                    valid = type(checked) in (int, float) and math.isfinite(checked)
                 except OverflowError:
                     valid = False
                 if not valid:
