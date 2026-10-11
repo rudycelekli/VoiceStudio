@@ -29,6 +29,10 @@ def register_proc(job_id: str, proc) -> None:
 
 
 def unregister_proc(job_id: str, proc) -> None:
+    # Caller cleanup may have failed to terminate this process. Preserve it
+    # for a later abort until its exit is confirmed.
+    if proc.returncode is None:
+        return
     with _active_procs_lock:
         lst = _active_procs.get(job_id)
         if lst and proc in lst:

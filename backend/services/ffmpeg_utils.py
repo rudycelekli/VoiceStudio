@@ -1051,12 +1051,6 @@ async def run_ffmpeg(cmd, timeout: float = 1800.0, capture: bool = True,
                         continue
                     return proc.returncode, out, err
                 finally:
-                    if job_id:
-                        try:
-                            unregister_proc(job_id, proc)
-                        except Exception as e:
-                            logger.debug("unregister_proc failed for %s: %s",
-                                         job_id.replace("\n", " ").replace("\r", " "), e)
                     # Guarantee reaping — prevents zombie pileup under timeouts or errors.
                     if proc.returncode is None:
                         try:
@@ -1069,6 +1063,12 @@ async def run_ffmpeg(cmd, timeout: float = 1800.0, capture: bool = True,
                         except asyncio.TimeoutError:
                             # Reaping is bounded; preserve the original error.
                             pass
+                    if job_id:
+                        try:
+                            unregister_proc(job_id, proc)
+                        except Exception as e:
+                            logger.debug("unregister_proc failed for %s: %s",
+                                         job_id.replace("\n", " ").replace("\r", " "), e)
     finally:
         if script_path:
             try:
