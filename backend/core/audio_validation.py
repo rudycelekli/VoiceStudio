@@ -128,7 +128,7 @@ def is_playable_wav(path: Optional[Path]) -> bool:
 
             with sf.SoundFile(str(path)) as audio:
                 if (
-                    audio.format != "WAV"
+                    audio.format not in {"WAV", "WAVEX"}
                     or not 0 < audio.channels <= _MAX_CHANNELS
                     or not 0 < audio.samplerate <= _MAX_SAMPLE_RATE
                     or len(audio) <= 0

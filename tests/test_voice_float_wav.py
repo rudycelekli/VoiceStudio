@@ -64,8 +64,16 @@ def test_partial_final_uncompressed_frame_is_not_playable(tmp_path, subtype, cha
     assert not is_playable_wav(path)
 
 
-def test_partial_extensible_pcm_frame_is_not_playable(tmp_path):
+@pytest.mark.parametrize("legacy_wave", [False, True])
+def test_partial_extensible_pcm_frame_is_not_playable(tmp_path, monkeypatch, legacy_wave):
+    from core import audio_validation
     from core.audio_validation import is_playable_wav
+    import wave
+
+    if legacy_wave:
+        def unsupported_extensible(*args, **kwargs):
+            raise wave.Error("Python 3.11 cannot decode WAVE_FORMAT_EXTENSIBLE")
+        monkeypatch.setattr(audio_validation.wave, "open", unsupported_extensible)
 
     path = tmp_path / 'extensible.wav'
     pcm_guid = bytes.fromhex('0100000000001000800000aa00389b71')
@@ -74,6 +82,7 @@ def test_partial_extensible_pcm_frame_is_not_playable(tmp_path):
         chunks = b'fmt ' + struct.pack('<I', len(fmt)) + fmt + b'data' + struct.pack('<I', len(payload)) + payload
         path.write_bytes(b'RIFF' + struct.pack('<I', len(chunks) + 4) + b'WAVE' + chunks)
     write(b'\x00' * 4)
+    assert sf.info(path).format == 'WAVEX'
     assert is_playable_wav(path)
     write(b'\x00' * 3)
     assert not is_playable_wav(path)
