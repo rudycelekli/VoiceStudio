@@ -17,7 +17,7 @@ metadata and the backend fallback mirror it.
 
 ### Fixed
 
-- Resolve nested SSML prosody in constant work per text run in both narration and the editor, preserving non-top closing tags and merging text with one final join. (#2736) — thanks @rudycelekli!
+- Handle deeply nested speech markup faster in both narration and the editor. (#2736) — thanks @rudycelekli!
 
 ## [0.5.7] — 2026-10-07
 
