@@ -779,7 +779,7 @@ def _render_chapter_cached(chapter, synth, sr, engine_id, resolve, cache_dir, le
     if lexicon:
         # Fold the lexicon into the cache key so editing pronunciations
         # invalidates cached chapters (reserved key can't collide with a voice id).
-        lex_sig = json.dumps(normalize_lexicon(lexicon), sort_keys=True)
+        lex_sig = json.dumps(list(normalize_lexicon(lexicon).items()))
         sig["\x00lexicon"] = lex_sig
     # Fold the #1208 expressive signature into BOTH cache layers so changing any
     # new knob (sampling, emotion, seed, cache opt-out) re-renders instead of
@@ -930,6 +930,11 @@ def _remote_chapter_call(chapter, *, engine_id, default_voice, voice_map,
     }
     def _signature(ref_audio: list) -> str:
         payload = {**params, "ref_audio": ref_audio}
+        if lexicon:
+            from services.pronunciation import normalize_lexicon
+            # Equal-length case variants resolve in insertion order. Sorting
+            # a mapping here would erase a change in the spoken replacement.
+            payload["lexicon"] = list(normalize_lexicon(lexicon).items())
         return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
     # Keyed by the data-dir-relative reference path, like the local chapter
