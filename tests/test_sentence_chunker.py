@@ -79,3 +79,18 @@ def test_short_flush_ends_the_first_flush_window():
     clause = "However, the remaining answer keeps going for quite a while, and then"
     assert chunker.push(clause) == []
     assert chunker.flush() == [clause]
+
+
+@pytest.mark.parametrize("text", ["Ready 2!", "Ready 2?", "Ready 2。", "नमस्ते।", "مرحبا؟", "ሰላም።", "Ready 2؟"])
+def test_short_unambiguous_sentences_emit_before_stream_finishes(text):
+    chunker = SentenceChunker()
+    assert chunker.push(text[:-1]) == []
+    assert chunker.push(text[-1]) == [text]
+    assert chunker.flush() == []
+
+
+@pytest.mark.parametrize("text", ["Value 2.", "U.S.", "Dr."])
+def test_short_ambiguous_periods_keep_waiting_for_continuation(text):
+    chunker = SentenceChunker()
+    assert chunker.push(text) == []
+    assert chunker.flush() == [text]

@@ -418,7 +418,7 @@ class SentenceChunker:
            Multiple terminators mean we may be mid-stream of a longer merged
            utterance like ``"Hey! Hi! Hello! This is a sentence."`` — let
            the standard path keep merging.
-        4. The char immediately before the terminator is **not** a digit
+        4. The char immediately before a period terminator is **not** a digit
            (avoids decimal mid-stream like ``"f(x) = x * 2."`` flushing
            before the ``54`` arrives).
         5. The trailing word is **not** a short ASCII all-caps acronym of
@@ -434,11 +434,12 @@ class SentenceChunker:
         TTS TTFB.
         """
         stripped = self._buffer.rstrip()
-        if not stripped or stripped[-1] not in _SENTENCE_TERMINATORS:
+        terminators = _SENTENCE_TERMINATORS + _UNAMBIGUOUS_NON_LATIN_TERMINATORS
+        if not stripped or stripped[-1] not in terminators:
             return []
 
         # Only one terminator in the entire buffer (the trailing one).
-        if sum(1 for c in stripped if c in _SENTENCE_TERMINATORS) != 1:
+        if sum(1 for c in stripped if c in terminators) != 1:
             return []
 
         # Word count: ``"Hi there!".split()`` -> 2.
@@ -449,7 +450,7 @@ class SentenceChunker:
         # Don't flush on potential decimals.
         if len(stripped) >= 2:
             prev = stripped[-2]
-            if prev.isdigit():
+            if stripped[-1] == "." and prev.isdigit():
                 return []
             # Don't flush on short all-caps acronyms ("U.", "US.", "USA.") —
             # these are likely abbreviation periods, not sentence ends. Only
@@ -459,8 +460,8 @@ class SentenceChunker:
             # must still be allowed to flush).
             terminator = stripped[-1]
             last_word = (
-                stripped.rstrip(_SENTENCE_TERMINATORS).split()[-1]
-                if stripped.rstrip(_SENTENCE_TERMINATORS).split()
+                stripped.rstrip(terminators).split()[-1]
+                if stripped.rstrip(terminators).split()
                 else ""
             )
             if (
