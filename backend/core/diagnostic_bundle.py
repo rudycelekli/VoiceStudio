@@ -27,6 +27,7 @@ import platform
 import sys
 import time
 import zipfile
+from collections import deque
 
 from core.config import OUTPUTS_DIR, LOG_PATH, CRASH_LOG_PATH
 from core.scrub import scrub_text
@@ -41,12 +42,12 @@ def _scrubbed_tail(path: str, max_lines: int) -> str:
     one-line note instead of a hard failure (the bundle must always build)."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+            lines = deque(f, maxlen=max_lines)
     except FileNotFoundError:
         return f"(no file at {scrub_text(path)})\n"
     except Exception as e:
         return f"(could not read {scrub_text(path)}: {scrub_text(str(e))})\n"
-    return scrub_text("".join(lines[-max_lines:]))
+    return scrub_text("".join(lines))
 
 
 def build_bundle(include_network: bool = False) -> str:

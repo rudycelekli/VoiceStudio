@@ -115,3 +115,22 @@ def test_bundle_survives_missing_logs(bundle_env, monkeypatch, tmp_path):
     path = build_bundle(include_network=False)
     with zipfile.ZipFile(path) as zf:
         assert "(no file at" in zf.read("logs/omnivoice.log.txt").decode()
+
+
+def test_diagnostic_tail_memory_depends_on_tail_size(tmp_path, monkeypatch):
+    import tracemalloc
+
+    path = tmp_path / "large.log"
+    line = "diagnostic line " + "x" * 112 + "\n"
+    with path.open("w") as handle:
+        for _ in range(48_000):
+            handle.write(line)
+    monkeypatch.setattr(diagnostic_bundle, "scrub_text", lambda text: text)
+    tracemalloc.start()
+    try:
+        result = diagnostic_bundle._scrubbed_tail(str(path), 5)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert result == line * 5
+    assert peak < 1_000_000, f"tail collection allocated {peak} bytes"
