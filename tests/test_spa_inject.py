@@ -77,3 +77,19 @@ def test_public_api_base_rejects_unusable_authorities(url):
 def test_public_api_base_accepts_valid_ipv6_and_ports(url):
     assert is_valid_public_api_base(url)
     assert "window.__OMNIVOICE_API_BASE__" in inject_api_base("<head></head>", url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://[::1]oops/api", "https://exa%zz.com/api",
+    "https://example.com%23evil.com/api", "https://example%2f.com/api",
+    "https://[v1.host]/api", "https://[fe80::1%25en0]/api", "https://exa\x7fmple.com/api",
+])
+def test_public_api_base_rejects_browser_invalid_hosts(url):
+    from core.spa_inject import is_valid_public_api_base
+    assert not is_valid_public_api_base(url)
+
+
+@pytest.mark.parametrize("url", ["https://%65xample.com/api", "https://例え.テスト/api"])
+def test_public_api_base_preserves_browser_valid_hosts(url):
+    from core.spa_inject import is_valid_public_api_base
+    assert is_valid_public_api_base(url)

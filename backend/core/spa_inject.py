@@ -11,10 +11,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 #: Absolute path of the web UI build to serve at "/". The packaged desktop app
@@ -97,11 +98,24 @@ def is_valid_public_api_base(value: str) -> bool:
         return False
     try:
         parsed = urlsplit(value)
+        # urlsplit accepts junk after an IPv6 bracket and does not decode DNS
+        # hosts. Browsers reject either malformed authority before making calls.
+        if parsed.netloc.startswith("["):
+            if not re.fullmatch(r"\[[^\]]+\](?::[0-9]*)?", parsed.netloc):
+                return False
+            host = parsed.hostname or ""
+            if "%" in host:
+                return False
+            ipaddress.IPv6Address(host)
+        else:
+            host = unquote(parsed.hostname or "", errors="strict")
+            if re.search(r"[\x00-\x20\x7f#/:<>?@\[\\\]\^|%]", host):
+                return False
         return (
             bool(parsed.hostname) and parsed.username is None and parsed.password is None
             and (parsed.port is None or 0 < parsed.port <= 65535)
         )
-    except ValueError:
+    except (ValueError, UnicodeError):
         return False
 
 
