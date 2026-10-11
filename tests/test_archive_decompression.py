@@ -4,7 +4,6 @@ import zipfile
 
 import pytest
 
-from core.safe_archive import ArchiveError, copy_member, open_bounded_zip, read_member
 
 
 def corrupt_bundle(compression):
@@ -23,6 +22,8 @@ def corrupt_bundle(compression):
 
 @pytest.mark.parametrize("compression", [zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA])
 def test_corrupt_compression_is_a_bundle_error(compression):
+    from core.safe_archive import ArchiveError, open_bounded_zip, read_member
+
     with open_bounded_zip(corrupt_bundle(compression)) as bundle:
         with pytest.raises(ArchiveError) as error:
             read_member(bundle, "manifest.json")
@@ -32,6 +33,8 @@ def test_corrupt_compression_is_a_bundle_error(compression):
 
 @pytest.mark.parametrize("compression", [zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA])
 def test_corrupt_copy_removes_partial_destination(tmp_path, compression):
+    from core.safe_archive import ArchiveError, open_bounded_zip, copy_member
+
     destination = tmp_path / "ref.wav"
     with open_bounded_zip(corrupt_bundle(compression)) as bundle:
         with pytest.raises(ArchiveError) as error:
@@ -42,6 +45,8 @@ def test_corrupt_copy_removes_partial_destination(tmp_path, compression):
 
 @pytest.mark.parametrize("compression", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA])
 def test_normal_members_and_byte_caps_remain_supported(compression):
+    from core.safe_archive import ArchiveError, open_bounded_zip, read_member
+
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=compression) as bundle:
         bundle.writestr("manifest.json", b'{"name":"voice"}')
@@ -53,6 +58,8 @@ def test_normal_members_and_byte_caps_remain_supported(compression):
 
 
 def test_destination_io_failure_is_not_an_invalid_bundle():
+    from core.safe_archive import open_bounded_zip
+
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         bundle.writestr("manifest.json", b"{}")
