@@ -149,11 +149,10 @@ def spell_out(word: str) -> str:
     """
     if not word:
         return ""
-    # Drop all existing whitespace, then interleave the visible characters with
-    # spaces. ``split()`` + ``"".join`` removes runs of whitespace first.
-    compact = "".join(word.split())
-    # Match the editor's Intl.Segmenter: combining marks and joined emoji
-    # belong to the preceding visible character, not separate spoken letters.
+    # Segment tokens separately: removing whitespace first could join an
+    # Indic virama, combining mark or regional indicator to the next token.
     import regex
 
-    return " ".join(regex.findall(r"\X", compact))
+    return " ".join(
+        cluster for token in word.split() for cluster in regex.findall(r"\X", token)
+    )

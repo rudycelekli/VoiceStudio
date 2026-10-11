@@ -1673,5 +1673,59 @@
         ]
       }
     ]
+  },
+  {
+    "name": "ssml_spell_grapheme_indic_boundary",
+    "input": "[spell]क् ष[/spell]",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "क् ष",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ssml_spell_grapheme_mark_boundary",
+    "input": "[spell]e ́A[/spell]",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "e ́ A",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ssml_spell_grapheme_flag_boundary",
+    "input": "[spell]🇺 🇸[/spell]",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "🇺 🇸",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
   }
 ]

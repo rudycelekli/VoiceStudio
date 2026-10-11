@@ -104,5 +104,5 @@ function splitCharacters(text) {
 
 /** Space out a run for [spell]: "USA" → "U S A". */
 export function spellOut(word) {
-  return splitCharacters((word || '').split(/\s+/).join('')).join(' ');
+  return (word || '').split(/\s+/).flatMap(splitCharacters).join(' ');
 }
