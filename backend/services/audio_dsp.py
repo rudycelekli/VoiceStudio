@@ -164,12 +164,12 @@ def trim_trailing_silence(
       • the trailing quiet span is already ≤ ``keep_tail_s`` (clean output);
       • the entire clip sits below the floor (dead render — downstream
         dead-render guards own that case, we must not shrink their evidence);
-      • empty input.
+      • empty or non-finite input (preserve it for later postprocessing).
 
     Accepts ``(n,)`` or ``(channels, n)`` tensors; the returned tensor keeps
     the input's shape convention.
     """
-    if audio_tensor.numel() == 0:
+    if audio_tensor.numel() == 0 or not bool(torch.isfinite(audio_tensor).all()):
         return audio_tensor
     # -50 dBFS ≈ 0.00316 linear — matches normalize_audio's silence floor.
     floor = 10 ** (-50.0 / 20.0)
@@ -193,7 +193,10 @@ def trim_speech_padding(audio_tensor: torch.Tensor, sample_rate: int) -> torch.T
     Never compress silence into the spoken slot or delete internal pauses.
     Silent/invalid outputs remain intact for the generation integrity guard.
     """
-    if audio_tensor.numel() == 0 or sample_rate <= 0:
+    if (
+        audio_tensor.numel() == 0 or sample_rate <= 0
+        or not bool(torch.isfinite(audio_tensor).all())
+    ):
         return audio_tensor
     envelope = audio_tensor.abs()
     if envelope.ndim > 1:
