@@ -1601,5 +1601,136 @@
         ]
       }
     ]
+  },
+  {
+    "name": "ssml_resolution_non_top_close",
+    "input": "[slow]a[fast]b[spell]C[/slow]D[/fast]E[/spell]f",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "a",
+            "pause_ms_after": 0,
+            "speed": 0.85,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "b",
+            "pause_ms_after": 0,
+            "speed": 1.15,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "C D",
+            "pause_ms_after": 0,
+            "speed": 1.15,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "E",
+            "pause_ms_after": 0,
+            "speed": null,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "f",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ssml_resolution_same_tag_nested",
+    "input": "[slow]a[slow]b[/slow]c[emphasis]d[fast]e[/emphasis]f[/fast]g[/slow]h",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "abc",
+            "pause_ms_after": 0,
+            "speed": 0.85,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "d",
+            "pause_ms_after": 0,
+            "speed": 0.92,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "e",
+            "pause_ms_after": 0,
+            "speed": 1.15,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "f",
+            "pause_ms_after": 0,
+            "speed": 1.15,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "g",
+            "pause_ms_after": 0,
+            "speed": 0.85,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "h",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "ssml_resolution_unmatched_unknown",
+    "input": "[/fast][SLOW]a[unknown]b[spell]C[/emphasis]D[/slow]E",
+    "default_voice": "v1",
+    "expected": [
+      {
+        "title": "Chapter 1",
+        "spans": [
+          {
+            "voice_id": "v1",
+            "text": "a[unknown]b",
+            "pause_ms_after": 0,
+            "speed": 0.85,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "C D",
+            "pause_ms_after": 0,
+            "speed": 0.85,
+            "join": "continue"
+          },
+          {
+            "voice_id": "v1",
+            "text": "E",
+            "pause_ms_after": 0,
+            "speed": null
+          }
+        ]
+      }
+    ]
   }
 ]
