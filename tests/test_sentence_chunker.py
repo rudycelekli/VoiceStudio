@@ -94,3 +94,13 @@ def test_short_ambiguous_periods_keep_waiting_for_continuation(text):
     chunker = SentenceChunker()
     assert chunker.push(text) == []
     assert chunker.flush() == [text]
+
+
+@pytest.mark.parametrize('tokens', [['２．', '５'], ['Value ２．', '５']])
+def test_short_full_width_decimals_wait_for_fractional_digits(tokens):
+    from services.sentence_chunker import SentenceChunker
+
+    chunker = SentenceChunker()
+    for token in tokens:
+        assert chunker.push(token) == []
+    assert chunker.flush() == [''.join(tokens)]

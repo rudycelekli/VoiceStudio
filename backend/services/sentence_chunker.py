@@ -450,7 +450,7 @@ class SentenceChunker:
         # Don't flush on potential decimals.
         if len(stripped) >= 2:
             prev = stripped[-2]
-            if stripped[-1] == "." and prev.isdigit():
+            if stripped[-1] in ".．" and prev.isdigit():
                 return []
             # Don't flush on short all-caps acronyms ("U.", "US.", "USA.") —
             # these are likely abbreviation periods, not sentence ends. Only
