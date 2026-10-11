@@ -223,3 +223,29 @@ def test_main_json_logging_setup_keeps_final_redaction():
     assert VALID_TOKEN not in output["exc"]
     assert "ValueError" in output["exc"]
     assert output["msg"] == "failed"
+
+
+def test_access_handler_replacement_preserves_token_redaction():
+    import io
+    from uvicorn.logging import AccessFormatter
+    from core.logging_filter import HFTokenRedactor, install_access_log_filter
+
+    logger = logging.Logger("owned.uvicorn.access", level=logging.INFO)
+    install_access_log_filter(logger)
+    # Uvicorn installs/replaces its access handler after main's initial setup.
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    handler.setFormatter(AccessFormatter(
+        fmt='%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+        use_colors=False,
+    ))
+    logger.handlers = [handler]
+    logger.info('%s - "%s %s HTTP/%s" %d', '127.0.0.1:1', 'GET',
+                '/missing?token=' + VALID_TOKEN, '1.1', 404)
+    assert VALID_TOKEN not in output.getvalue()
+    assert '/missing?token=hf_***REDACTED***' in output.getvalue()
+    assert '404' in output.getvalue()
+    install_access_log_filter(logger)
+    assert sum(isinstance(f, HFTokenRedactor) for f in logger.filters) == 1
+    logger.info('%s - "%s %s HTTP/%s" %d', '127.0.0.1:1', 'GET', '/health', '1.1', 200)
+    assert '/health' not in output.getvalue()

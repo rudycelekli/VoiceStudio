@@ -54,16 +54,13 @@ def _run(args):
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=20)
         if r.returncode != 0:
-            diagnostic = (r.stderr or r.stdout or "tailscale serve failed").strip()
-            logger.error(
-                "Tailscale command exited with code %s: %.2000r",
-                r.returncode,
-                diagnostic,
-            )
+            # Command output can contain credentials or home paths. Keep only
+            # stable process metadata in the local log, not arbitrary output.
+            logger.error("Tailscale command exited with code %s", r.returncode)
             return {"ok": False, "error": "tailscale command failed"}
         return {"ok": True, "error": ""}
-    except Exception:
-        logger.exception("Tailscale command failed")
+    except Exception as exc:
+        logger.error("Tailscale command failed (%s)", type(exc).__name__)
         return {"ok": False, "error": "tailscale command failed"}
 
 

@@ -17,7 +17,7 @@ metadata and the backend fallback mirror it.
 
 ### Fixed
 
-- Runtime logs redact Hugging Face tokens inside nested values, tracebacks, and custom formatter output. (#2715) — thanks @rudycelekli!
+- Runtime and access logs redact Hugging Face tokens, and Tailscale diagnostics retain safe status details without command output or exception text. (#2715) — thanks @rudycelekli!
 
 ## [0.5.7] — 2026-10-07
 

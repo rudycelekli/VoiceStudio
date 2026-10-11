@@ -136,8 +136,9 @@ def install_redaction_filter(root_logger: logging.Logger | None = None) -> None:
 
 
 def install_access_log_filter(logger: logging.Logger | None = None) -> None:
-    """Install the routine-health filter on Uvicorn's access logger once."""
+    """Install health suppression and token redaction on the access logger."""
     target = logger or logging.getLogger("uvicorn.access")
+    install_redaction_filter(target)
     if not any(isinstance(item, RoutineHealthAccessFilter) for item in target.filters):
         target.addFilter(RoutineHealthAccessFilter())
 

@@ -197,9 +197,9 @@ def test_tailscale_enable_failure_keeps_service_output_private(monkeypatch, capl
     assert "/home/alice" not in caplog.text
 
 
-def test_tailscale_command_exception_stays_in_local_log(monkeypatch, caplog):
+def test_tailscale_command_exception_logs_only_safe_context(monkeypatch, caplog):
     from services import tailscale
-    from core.logging_filter import REDACTED, install_redaction_filter
+    from core.logging_filter import install_redaction_filter
 
     # Exercise configured logging without depending on another test importing
     # main, and restore pytest's shared capture handler after this test.
@@ -221,12 +221,14 @@ def test_tailscale_command_exception_stays_in_local_log(monkeypatch, caplog):
 
     assert result == {"ok": False, "error": "tailscale command failed"}
     synthetic_token = "hf_" + "abcdefghijklmnopqrstuvwxyz" + "1234567890"
-    assert private.replace(synthetic_token, REDACTED) in caplog.text
+    assert "Tailscale command failed (RuntimeError)" in caplog.text
     assert synthetic_token not in caplog.text
+    assert "TOKEN=private-value" not in caplog.text
+    assert "/home/alice" not in caplog.text
     assert private not in str(result)
 
 
-def test_tailscale_nonzero_output_stays_in_local_log(monkeypatch, caplog):
+def test_tailscale_nonzero_output_logs_only_exit_code(monkeypatch, caplog):
     from types import SimpleNamespace
 
     from services import tailscale
@@ -246,8 +248,9 @@ def test_tailscale_nonzero_output_stays_in_local_log(monkeypatch, caplog):
         result = tailscale._run(["tailscale", "serve"])
 
     assert result == {"ok": False, "error": "tailscale command failed"}
-    assert "/home/alice" in caplog.text
-    assert "TOKEN=private-value" in caplog.text
+    assert "Tailscale command exited with code 1" in caplog.text
+    assert "/home/alice" not in caplog.text
+    assert "TOKEN=private-value" not in caplog.text
     assert private not in str(result)
 
 
