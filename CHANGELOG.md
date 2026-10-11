@@ -15,6 +15,10 @@ metadata and the backend fallback mirror it.
 - Models without a plainly commercial licence, including the default OmniVoice model, must have their licence accepted once before use; VoiceStudio is not the licensor and cannot grant model rights. (#2689)
 - The model licence dialog is clearer: a plain summary, what the licence allows, and collapsible details; acceptance records the date and exact terms, and changed terms ask again. (#2689)
 
+### Fixed
+
+- Switching away from a model mirror preserves user changes to implicit-token settings made after the mirror policy applied. (#2725) — thanks @rudycelekli!
+
 ## [0.5.7] — 2026-10-07
 
 **VoiceStudio now runs on PCs without a GPU and recovers instead of giving up.** Voice cloning uses the speech-to-text model you installed from Model Catalogue, GPU-less computers get the small CPU PyTorch build, and slow or busy backends are no longer reported as failed.
