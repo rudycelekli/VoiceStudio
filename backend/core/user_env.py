@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from typing import Optional
 
 USER_ENV_PATH = os.path.expanduser("~/.config/omnivoice/env")
@@ -46,14 +47,24 @@ def _opener_0600(path: str, flags: int) -> int:
 
 
 def _write_lines(path: str, lines: list[str]) -> None:
+    path = os.path.realpath(path)
     parent = os.path.dirname(path)
     if parent:  # bare filename (e.g. an OMNIVOICE_ENV_FILE override) has no parent
         os.makedirs(parent, exist_ok=True)
     body = "\n".join(lines)
     if body and not body.endswith("\n"):
         body += "\n"
-    with open(path, "w", encoding="utf-8", opener=_opener_0600) as f:
-        f.write(body)
+    fd, temporary = tempfile.mkstemp(prefix=".omnivoice-env-", dir=parent or ".")
+    os.close(fd)
+    try:
+        with open(temporary, "w", encoding="utf-8", opener=_opener_0600) as f:
+            f.write(body)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
     try:
         os.chmod(path, 0o600)  # tighten an existing file that predates the opener
     except OSError:

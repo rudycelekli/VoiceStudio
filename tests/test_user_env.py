@@ -124,3 +124,65 @@ def test_hand_written_unquoted_values_still_expand_variables(tmp_path, monkeypat
     assert os.environ["OMNIVOICE_TEST_SQ"] == "${HOME}/sq"
     assert os.environ["OMNIVOICE_TEST_LAST"] == "/home/u/second"
     assert os.environ["OMNIVOICE_TEST_PATH"] == "/chosen/${HOME}/models"
+
+
+def test_failed_write_keeps_existing_saved_settings(tmp_path, monkeypatch):
+    import builtins
+
+    path = tmp_path / "env"
+    original = "KEEP=original\nKEY=old\n"
+    path.write_text(original)
+    real_open = builtins.open
+
+    class FailingWriter:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+
+        def write(self, body):
+            self.handle.write(body[:2])
+            self.handle.flush()
+            raise OSError("simulated disk full")
+
+    def open_with_failed_writes(name, mode="r", **kwargs):
+        handle = real_open(name, mode, **kwargs)
+        return FailingWriter(handle) if mode == "w" else handle
+
+    monkeypatch.setattr(user_env, "open", open_with_failed_writes, raising=False)
+    with pytest.raises(OSError, match="simulated disk full"):
+        user_env.set_user_env("KEY", "fresh", path=str(path))
+    assert path.read_text() == original
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_failed_replace_keeps_existing_settings_and_removes_temporary_file(tmp_path, monkeypatch):
+    path = tmp_path / "env"
+    original = "KEEP=original\nKEY=old\n"
+    path.write_text(original)
+
+    def fail_replace(source, destination):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(user_env.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated replace failure"):
+        user_env.set_user_env("KEY", "fresh", path=str(path))
+    assert path.read_text() == original
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_atomic_write_preserves_existing_symlink_destination(tmp_path):
+    target = tmp_path / "target-env"
+    target.write_text("KEY=old\n")
+    path = tmp_path / "env"
+    try:
+        path.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    user_env.set_user_env("KEY", "fresh", path=str(path))
+    assert path.is_symlink()
+    assert target.read_text() == "KEY=fresh\n"
