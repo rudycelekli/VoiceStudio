@@ -135,7 +135,8 @@ def test_upsert_replaces_all_effective_assignments(tmp_path, monkeypatch, second
     user_env.set_user_env("KEY", "fresh", path=str(path))
     assert user_env.get_user_env("KEY", path=str(path)) == "fresh"
     assert dotenv_values(path)["KEY"] == "fresh"
-    monkeypatch.delenv("KEY", raising=False)
+    monkeypatch.setenv("KEY", "unset-sentinel")
+    monkeypatch.setenv("OTHER", "unset-sentinel")
     user_env.load_into_environ(str(path))
     assert os.environ["KEY"] == "fresh"
     assert "# kept comment\n" in path.read_text()
