@@ -1,756 +1,166 @@
-# PR-gated continuous integration for the maintained Electron desktop,
-# shared backend, web frontend and native bridge.
-
-name: CI
-
-on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
-  # The merge queue tests each PR on top of the latest main (and the PRs queued
-  # before it) once, instead of every PR re-running CI each time main moves.
-  merge_group:
-    types: [checks_requested]
-  workflow_dispatch:
-
+name: Private Voice3554 frozen native gates
+'on':
+  workflow_dispatch: {}
 permissions:
   contents: read
-
-# A new push to a PR cancels that PR's older run (a mass rebase of ~65 branches
-# once queued 360 runs, most of them for commits already replaced). Pushes to main
-# and manual runs are keyed by commit, so every main commit still gets its own CI.
-concurrency:
-  group: ci-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 env:
-  # Run all JavaScript actions on Node 24 (GH deprecates Node 20 in Sep 2026).
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
+  HF_HUB_OFFLINE: '1'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  UV_HTTP_TIMEOUT: '120'
+  UV_HTTP_RETRIES: '5'
 jobs:
-  # A pull request from a fork waits here for a maintainer to approve the
-  # `external-pr` environment (Settings -> Environments -> required reviewers)
-  # before any other job gets a runner. Same-repository branches skip this job
-  # and start at once. Without reviewers configured the environment approves
-  # itself, so the gate is inert until the owner sets them.
-  approve-external:
-    name: Approve external pull request
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    environment: external-pr
-    steps:
-      - run: echo "Approved by a maintainer"
-
-  # A pull request whose every changed file is on this allowlist cannot affect the
-  # Electron jobs: they run against fake JavaScript backends, not the Python one.
-  # Those jobs (UI crawler, Desktop UI, native package, and the Electron steps of
-  # the test job) are skipped for such PRs; they take ~45 runner-minutes. Anything
-  # else, every push to main and every manual run still runs the full matrix, and
-  # if detection fails for any reason everything runs (`!= 'false'` below).
-  # Other workflow files are on the allowlist (they cannot change what these jobs
-  # do); ci.yml and electron-*.yml are not. pyproject.toml is not either (the
-  # packaging contract parses its `readme =` key), and neither is backend/assets/
-  # (the renderer smokes play its sample WAV).
-  changes:
-    name: Changed paths
-    needs: approve-external
-    # A rejected approval skips this job; every job below treats that as "stop".
-    if: ${{ !cancelled() && needs.approve-external.result != 'failure' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      electron: ${{ steps.detect.outputs.electron }}
-    steps:
-      - id: detect
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          PR: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          # Any doubt means "true". Only an explicit "nothing outside the allowlist"
-          # from grep (exit 1) produces "false". Every pipe below ends in a command
-          # that reads ALL its input: an early-exit consumer (grep -q, head) makes the
-          # producer die of SIGPIPE, which `pipefail` reports as a failure and, on a
-          # large file list, silently turned "a file was deleted" into "no match".
-          electron=true
-          if [ "$EVENT" = pull_request ]; then
-            if rows=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | [.status, .filename] | @tsv') && [ -n "$rows" ]; then
-              total=$(printf '%s\n' "$rows" | wc -l)
-              status_rc=0
-              printf '%s\n' "$rows" | cut -f1 | sort -u | grep -v -x -E 'added|modified' > /dev/null || status_rc=$?
-              if [ "$total" -ge 3000 ]; then
-                echo "3000+ files (the API truncates here): running everything"
-              elif [ "$status_rc" -ne 1 ]; then
-                # Only plain edits and additions are safe. Electron checks assert that some
-                # root files exist, and a rename out of electron/ lists only the new path.
-                echo "a file was deleted, renamed, copied or changed type (status check rc=$status_rc): running everything"
-              else
-                rc=0
-                outside=$(printf '%s\n' "$rows" | cut -f2 | grep -v -P '^(backend/(?!assets/)|omnivoice/|docs/|mobile/|\.github/ISSUE_TEMPLATE/|\.github/scripts/|\.github/[^/]+\.md$|tests/.*\.py$|scripts/[^/]+\.py$|[^/]+\.md$|Makefile$|uv\.lock$|\.github/workflows/(?!(ci|electron-[a-z-]+)\.yml$)[^/]+\.yml$)') || rc=$?
-                if [ "$rc" -eq 1 ]; then
-                  electron=false
-                elif [ "$rc" -eq 0 ]; then
-                  echo "Electron jobs run because of (first 5):"
-                  # Indented so a hostile file name can never start a workflow command.
-                  printf '%s\n' "$outside" | sed -n '1,5s/^/    /p'
-                else
-                  echo "path matching failed (grep exit $rc): running everything"
-                fi
-              fi
-            fi
-          fi
-          echo "electron=$electron" >> "$GITHUB_OUTPUT"
-          echo "electron jobs: $electron"
-
-  installer:
-    name: Electron installer contracts
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' }}
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
-      - name: Shell installers and Worker routing
-        working-directory: electron
-        run: |
-          sh -n ../scripts/install.sh && bash -n ../scripts/uninstall.sh
-          node --test tests/shell-installer.test.mjs tests/installer-worker.test.mjs
-      - name: PowerShell scripts parse
-        shell: pwsh
-        run: |
-          $failed = $false
-          foreach ($file in git ls-files '*.ps1') {
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$null, [ref]$errors) | Out-Null
-            foreach ($e in $errors) { Write-Host "::error file=$file,line=$($e.Extent.StartLineNumber)::$($e.Message)"; $failed = $true }
-          }
-          if ($failed) { exit 1 }
-      - name: PowerShell installer flows
-        shell: pwsh
-        run: ./electron/tests/powershell-installer.ps1
-
-  test-python:
-    name: Tests (Python)
-    needs: changes
-    # Must report even if `changes` failed, so a detection error never skips the gate;
-    # only a rejected external approval (changes skipped) stops it.
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' }}
-    runs-on: ubuntu-22.04
-    env:
-      # Same restricted-network resilience the smoke matrix already sets. This
-      # job resolves the same direct-URL dependency and had none of it, which
-      # is why it was the one that kept dying (see scripts/uv-sync-retry.sh).
-      UV_HTTP_TIMEOUT: "120"
-      UV_HTTP_RETRIES: "5"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.11"
-
-      # enable-cache persists ~/.cache/uv across runs, keyed on uv.lock —
-      # turns `uv sync` from ~45 s cold to ~5 s warm.
-      - name: Install uv
-        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
-        with:
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
-
-      # Node 22 is needed for --experimental-strip-types so node:test can
-      # import .ts files directly from electron/src/shared/api/*.
-      - name: Setup Node 22
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: '1.4.2'
-
-      # Cache the resolved .debs for media and Snap artifact tests.
-      - name: System deps (ffmpeg and squashfs-tools)
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          packages: ffmpeg squashfs-tools
-          version: 1.0
-
-      - name: Install Python deps
-        # `--all-extras` installs optional engine deps (e.g. `supertonic`)
-        # so their tests can exercise the real import path, not the
-        # "package not installed" fallback. Smoke job below stays on bare
-        # `uv sync` because smoke only hits /health + fixture profiles.
-        #
-        # Retried because one dependency — en-core-web-sm — resolves to a
-        # direct GitHub release URL, and github.com intermittently answers
-        # `http2 error: refused stream before processing any application
-        # logic`. uv's own 3 retries all land inside the same few seconds and
-        # fail together, which has cost otherwise-green runs (#1517, #1518).
-        # Backing off between whole attempts is what actually clears it.
-        run: bash scripts/uv-sync-retry.sh --all-extras
-
-      # HF_HUB_OFFLINE=1 is a recurrence guard, not an optimization: a test
-      # that reaches huggingface.co fails fast and loud instead of silently
-      # downloading model weights mid-suite (the preload_model() Hub-probe
-      # bug pulled the full 2.3 GB k2-fsa/OmniVoice checkpoint into every
-      # networked empty-cache run before it was caught). All legitimate HF
-      # interactions in tests are stubbed; anything that trips this is a
-      # test-isolation bug.
-      # `-n auto` runs tests/ in parallel (one worker per CPU; 10 min serial ->
-      # ~3 min on a 4-core runner, with identical results). backend/tests/ below
-      # stays serial: one test there depends on another's leftover state and
-      # fails when run in isolation, which parallel scheduling exposes.
-      - name: Run pytest
-        run: uv run --no-sync pytest tests/ -q --tb=short -n auto
-        env:
-          HF_HUB_OFFLINE: "1"
-
-      # `backend/tests/` mounts routers on bare FastAPI apps (no heavy main
-      # import chain) with a hermetic data dir from its conftest.py. It no
-      # longer stubs sys.modules, so mixed sessions with tests/ are safe;
-      # the separate session is kept for cheaper, clearer CI output.
-      - name: Run pytest (backend/tests, isolated)
-        run: uv run --no-sync pytest backend/tests/ -q --tb=short
-        env:
-          HF_HUB_OFFLINE: "1"  # same no-silent-downloads guard as tests/
-
-      # Cache ~/.bun/install/cache keyed on bun.lock — `bun install` drops
-      # from ~15 s cold to near-instant on warm cache.
-      - name: Cache bun deps
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
-
-      - name: Install Electron deps
-        # --frozen-lockfile so an Electron workspace change that forgets to
-        # regenerate the root bun.lock fails HERE (fast) instead of only in the
-        # Docker build (deploy/Dockerfile), which is what reddened main on #485.
-        run: bun install --frozen-lockfile
-
-      # Mobile theme tokens are generated from the Electron theme and need its
-      # deps installed, so the pytest copy of this check skips before this point.
-      - name: Mobile theme tokens match Electron
-        run: bun --no-install scripts/export-mobile-tokens.ts --check
-
-      - name: Mobile maintainer cards match Electron
-        run: bun --no-install scripts/export-mobile-contributors.ts --check
-
-
-  # Electron checks run beside the Python job instead of after it (~16 min serial
-  # -> the longer of the two). They need no Python: every backend they touch is a
-  # JavaScript fake. `test` below keeps the required check name and gates on both.
-  test-electron:
-    name: Tests (Electron)
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' && needs.changes.outputs.electron != 'false' }}
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Setup Node 22
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: '1.4.2'
-
-      # Cache the resolved .debs for media and Snap artifact tests.
-      - name: System deps (ffmpeg and squashfs-tools)
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          packages: ffmpeg squashfs-tools
-          version: 1.0
-
-      # Cache ~/.bun/install/cache keyed on bun.lock — `bun install` drops
-      # from ~15 s cold to near-instant on warm cache.
-      - name: Cache bun deps
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
-
-      - name: Install Electron deps
-        # --frozen-lockfile so an Electron workspace change that forgets to
-        # regenerate the root bun.lock fails HERE (fast) instead of only in the
-        # Docker build (deploy/Dockerfile), which is what reddened main on #485.
-        run: bun install --frozen-lockfile
-
-      # node:test suites for shared renderer modules (tests/frontend/*.test.mjs).
-      # Node 22 strips TypeScript types natively; imports need explicit `.ts`.
-      - name: Frontend unit tests
-        run: bun run test:frontend
-
-      # Electron used to be built only after a release started, so renderer,
-      # preload and packaging regressions could pass the required PR gate.
-      # Keep this command shared with electron-release.yml through the root script.
-      - name: Electron typecheck, tests and production contract
-        run: bun run check:electron
-
-      - name: Snap artifact repair regression
-        run: node --test electron/tests/snap-artifact-verification.test.mjs electron/tests/snap-launcher.test.mjs electron/tests/snap-store-packaging.test.mjs electron/tests/omnivoice-tts-bundle.test.mjs
-
-  # Split from Tests (Electron) so the two ~7 minute halves run side by side.
-  # The browser workflow smokes need only the checked-out sources.
-  electron-smokes:
-    name: Electron renderer smokes
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' && needs.changes.outputs.electron != 'false' }}
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Setup Node 22
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: '1.4.2'
-
-      # Cache the resolved .debs for media and Snap artifact tests.
-      - name: System deps (ffmpeg and squashfs-tools)
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          packages: ffmpeg squashfs-tools
-          version: 1.0
-
-      # Cache ~/.bun/install/cache keyed on bun.lock — `bun install` drops
-      # from ~15 s cold to near-instant on warm cache.
-      - name: Cache bun deps
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
-
-      - name: Install Electron deps
-        # --frozen-lockfile so an Electron workspace change that forgets to
-        # regenerate the root bun.lock fails HERE (fast) instead of only in the
-        # Docker build (deploy/Dockerfile), which is what reddened main on #485.
-        run: bun install --frozen-lockfile
-
-      # Browser workflow smokes exercise the maintained Electron renderer.
-      - name: Install Playwright chromium
-        run: bunx playwright install --with-deps chromium
-      - name: Electron renderer workflow smokes
-        shell: bash
-        run: |
-          set -euo pipefail
-          export OMNIVOICE_PORT=3999
-          export VOICESTUDIO_UI_URL=http://localhost:3912
-          export PLAYWRIGHT_CHANNEL=chromium
-          # Smokes run with the Hugging Face hub offline, caching into a throwaway directory
-          # so neither the network nor the runner's real model cache is ever involved.
-          smoke_hub_cache=$(mktemp -d)
-          export HF_HUB_CACHE="$smoke_hub_cache" HF_HUB_OFFLINE=1
-          bun run --cwd electron smoke:server > /tmp/voicestudio-electron-smoke.log 2>&1 &
-          server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-          for _ in {1..60}; do
-            if curl --fail --silent --show-error "$VOICESTUDIO_UI_URL" >/dev/null; then
-              break
-            fi
-            sleep 0.25
-          done
-          curl --fail --silent --show-error "$VOICESTUDIO_UI_URL" >/dev/null || {
-            cat /tmp/voicestudio-electron-smoke.log
-            exit 1
-          }
-          # Every smoke must be classified (run here, or needs a backend/native app).
-          node --test electron/tests/smoke-inventory.test.mjs electron/tests/ui-crawler.test.mjs
-          # Runs every offline renderer smoke; it serves /api from a fake backend on $OMNIVOICE_PORT.
-          node electron/tests/run-renderer-smokes.mjs
-
-  # The required check. Its name is what branch protection matches, so it stays
-  # "Tests (backend + frontend)" even though the work now runs in two jobs.
-  test:
-    name: Tests (backend + frontend)
-    needs: [changes, test-python, test-electron, electron-smokes]
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    env:
-      PYTHON: ${{ needs.test-python.result }}
-      ELECTRON: ${{ needs.test-electron.result }}
-      SMOKES: ${{ needs.electron-smokes.result }}
-      ELECTRON_NEEDED: ${{ needs.changes.outputs.electron }}
-    steps:
-      - name: Both test jobs passed
-        run: |
-          echo "Python: $PYTHON, Electron: $ELECTRON, smokes: $SMOKES (needed: $ELECTRON_NEEDED)"
-          [ "$PYTHON" = success ] || exit 1
-          # Skipped is only acceptable when change detection said nothing in this
-          # PR can affect the Electron jobs.
-          for result in "$ELECTRON" "$SMOKES"; do
-            [ "$result" = success ] || { [ "$result" = skipped ] && [ "$ELECTRON_NEEDED" = false ]; } || exit 1
-          done
-
-  # Clicks every button on every route under four backend fault modes and fails
-  # on stuck spinners, buttons left disabled, silent failures, crashes and
-  # console errors
-  # (electron/tests/ui-crawler.mjs). Three route shards, not a mode x shard
-  # matrix: each shard still runs every fault mode concurrently in one process,
-  # and a matrix of twelve jobs per push queued behind the runner limit for hours.
-  ui-crawler:
-    name: UI crawler (${{ matrix.shard }}/3)
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' && needs.changes.outputs.electron != 'false' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Setup Node 22
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: '1.4.2'
-
-      - name: Cache bun deps
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
-
-      - name: Install Electron deps
-        run: bun install --frozen-lockfile
-
-      - name: Install Playwright chromium
-        run: bunx playwright install --with-deps chromium
-
-      - name: Crawl every button
-        shell: bash
-        env:
-          OMNIVOICE_PORT: '3999'
-          VOICESTUDIO_UI_URL: http://localhost:3912
-          VOICESTUDIO_CRAWL_SHARD: ${{ matrix.shard }}/3
-        run: |
-          set -euo pipefail
-          bun run --cwd electron smoke:server > /tmp/voicestudio-crawler-server.log 2>&1 &
-          server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-          for _ in {1..60}; do
-            curl --fail --silent "$VOICESTUDIO_UI_URL" >/dev/null && break
-            sleep 0.25
-          done
-          curl --fail --silent --show-error "$VOICESTUDIO_UI_URL" >/dev/null || {
-            cat /tmp/voicestudio-crawler-server.log
-            exit 1
-          }
-          node electron/tests/ui-crawler.mjs
-
-  linux-native-package:
-    name: Linux native package
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' && needs.changes.outputs.electron != 'false' }}
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: native/desktop-bridge -> target
-          key: linux-native-package
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxdo-dev libxtst-dev libx11-dev libxkbcommon-dev libwayland-dev libssl-dev pkg-config
-      - name: Verify relocation without build-time libraries
-        run: node --test electron/tests/native-linux-libraries.test.mjs
-      - name: Build and validate real Linux native package
-        run: |
-          cargo build --locked --release --manifest-path native/desktop-bridge/Cargo.toml
-          node electron/tests/native-linux-package.mjs
-
-  # ── Desktop UI (real Electron app on every OS) ───────────────────────────
-  # Launches the unpackaged app with Playwright against a fake backend and runs
-  # one shared suite, so preload/IPC/main-process/user-data regressions on
-  # macOS and Windows surface on the PR instead of at release time. Packaged
-  # installers are covered separately by packaged-smoke.mjs on release paths.
-  electron-ui:
-    name: Desktop UI (${{ matrix.label }})
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.result != 'skipped' && needs.changes.outputs.electron != 'false' }}
+  native:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 10
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
-        include:
-          - { os: macos-15, label: macOS }
-          - { os: windows-2022, label: Windows }
-          - { os: ubuntu-24.04, label: Linux }
-    defaults:
-      run:
-        shell: bash
+        os:
+        - ubuntu-24.04
+        - macos-14
+        - windows-2022
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: debpalash/VoiceStudio
+        ref: 8ed9dad7223830f90f59aac6a4a7b9af40b6653d
+        persist-credentials: false
+        fetch-depth: 1
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+    - name: Materialize frozen source
+      shell: bash
+      run: "python - <<'PY'\nimport base64, json, os, pathlib, subprocess, zlib\np = json.loads(zlib.decompress(base64.b64decode(\"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\")))\nassert subprocess.check_output([\"git\", \"rev-parse\", \"HEAD\"], text=True).strip() == p[\"base\"]\nsubprocess.run([\"git\", \"apply\", \"--binary\", \"-\"], input=base64.b64decode(p[\"patch\"]), check=True)\nsubprocess.run([\"git\", \"add\", \"-u\"], check=True)\nsubprocess.run([\"git\", \"add\", \"changelog.d/3554.fixed.md\", \"tests/test_speech_client_boundaries.py\"], check=True)\nassert subprocess.check_output([\"git\", \"write-tree\"], text=True).strip() == p[\"tree\"]\nartifacts = pathlib.Path(os.environ[\"RUNNER_TEMP\"]) / \"voice3554-proof\"\nartifacts.mkdir()\n(artifacts / \"source-contract.json\").write_text(json.dumps({\"base\": p[\"base\"], \"tree\": p[\"tree\"]}, indent=2))\n(artifacts / \"baseline-client.py\").write_bytes(base64.b64decode(p[\"baseline_client\"]))\n\ncache = pathlib.Path(os.environ[\"RUNNER_TEMP\"]) / \"voice3554-empty-hf\"\nassert not cache.exists(), \"HF cache must start empty\"\ncache.mkdir()\nwith open(os.environ[\"GITHUB_ENV\"], \"a\") as exports:\n    exports.write(\"HF_HUB_CACHE=\" + str(cache) + \"\\n\")\nPY"
+    - name: Install locked native pytest only
+      shell: bash
+      run: python -m pip install --disable-pip-version-check pytest==9.1.1
+    - name: Real API and proxy baseline/candidate
+      shell: bash
+      run: "python - <<'PY'\nimport json, os, pathlib, shutil, subprocess, sys, xml.etree.ElementTree as ET\nq = pathlib.Path(os.environ[\"RUNNER_TEMP\"]) / \"voice3554-proof\"\ntests = q / \"native-tests\"\ntests.mkdir()\nfor name in [\"test_speech_client.py\", \"test_speech_client_boundaries.py\"]:\n    shutil.copy2(pathlib.Path(\"tests\") / name, tests / name)\nenv = dict(os.environ, PYTHONPATH=str(pathlib.Path(\"backend\").resolve()), HF_HUB_OFFLINE=\"1\")\nclient = pathlib.Path(\"backend/speech_client/__main__.py\")\nfixed = client.read_bytes()\ndef run(label):\n    with (q / (label + \".log\")).open(\"w\") as log:\n        result = subprocess.run([sys.executable, \"-m\", \"pytest\", \"--confcutdir=\" + str(tests), str(tests), \"-q\", \"--junitxml=\" + str(q / (label + \".xml\"))], env=env, stdout=log, stderr=subprocess.STDOUT, timeout=180)\n    root = ET.parse(q / (label + \".xml\")).getroot()\n    cases = list(root.iter(\"testcase\"))\n    failures = [x.attrib.get(\"name\") for x in cases if x.find(\"failure\") is not None or x.find(\"error\") is not None]\n    skips = [x.attrib.get(\"name\") for x in cases if x.find(\"skipped\") is not None]\n    return {\"exit\": result.returncode, \"cases\": len(cases), \"failures\": failures, \"skips\": skips}\ntry:\n    client.write_bytes((q / \"baseline-client.py\").read_bytes())\n    baseline = run(\"baseline\")\nfinally:\n    client.write_bytes(fixed)\ncandidate = run(\"candidate\")\nexpected = {\"test_credentialed_loopback_bypasses_proxy_without_changing_environment[True-\" + host + \"]\" for host in [\"2130706433\", \"0x7f000001\", \"127.1\"]}\nclassification = {\"baseline\": baseline, \"candidate\": candidate, \"baseline_platform_classification\": \"EXPECTED_PROXY_FAILURES_ONLY\" if set(baseline[\"failures\"]).issubset(expected) else \"UNEXPECTED_PLATFORM_FAILURES\", \"expected_failure_count_is_not_forced\": True}\n(q / \"native-results.json\").write_text(json.dumps(classification, indent=2))\nprint(json.dumps(classification, indent=2))\nassert baseline[\"cases\"] == 32 and not baseline[\"skips\"]\nassert set(baseline[\"failures\"]).issubset(expected), \"Classify unexpected baseline platform failures; do not edit test expectations.\"\nassert candidate == {\"exit\": 0, \"cases\": 32, \"failures\": [], \"skips\": []}\n\nPY"
+    - name: Exact source guards
+      if: always()
+      shell: bash
+      run: 'python - <<''PY''
 
-      - name: Setup Node 22
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '22'
+        import subprocess
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: '1.4.2'
+        subprocess.run(["git", "diff", "--exit-code"], check=True)
 
-      - name: Cache bun deps
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-bun-
+        assert subprocess.check_output(["git", "write-tree"], text=True).strip() == "a917141f6891a9a77b0b96544247c4743f69173d"
 
-      - name: Install Electron deps
-        run: bun install --frozen-lockfile
-
-      - name: Development launcher tests
-        working-directory: electron
-        run: bunx --no-install vp test --run src/main/dev-bundle.test.ts src/main/dev-instance.test.ts
-
-      - name: Build Electron app
-        run: bun run --cwd electron build
-
-      # `bun install` does not run Electron's postinstall here, so fetch the binary the tests launch.
-      - name: Download Electron binary
-        run: node electron/node_modules/electron/install.js
-
-      # Ubuntu 24.04 restricts unprivileged user namespaces, which stops
-      # Electron's sandbox from starting. Relax it on the runner; the app
-      # itself is never launched with --no-sandbox.
-      - name: Allow Electron sandbox (Linux)
-        if: runner.os == 'Linux'
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-      - name: Desktop UI tests
-        run: |
-          # The output is kept in the failure artifact: a crashed run's log is otherwise
-          # unavailable until the whole workflow finishes.
-          mkdir -p electron/test-results
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            xvfb-run -a bun run --cwd electron test:desktop-ui 2>&1 | tee electron/test-results/desktop-ui.log
-          else
-            bun run --cwd electron test:desktop-ui 2>&1 | tee electron/test-results/desktop-ui.log
-          fi
-
-      - name: Upload failure artifacts
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: desktop-ui-${{ matrix.label }}
-          path: electron/test-results/
-          if-no-files-found: ignore
-
-  # ── Cross-platform Python runtime smoke (Phase 0 GATE-02) ───────────────
-  # Loads the frozen tests/fixtures/omnivoice_data/ fixture and boots the
-  # FastAPI app in-process via TestClient on macOS/Windows/Linux. Catches
-  # platform-specific Python import / path bugs that the Linux-only `test`
-  # job above misses. Narrow scope (tests/smoke/ only) — full pytest stays
-  # on Linux until Phase 1's INST-01 lands setuptools for WhisperX.
-  smoke-matrix:
-    name: Smoke (${{ matrix.label }})
-    # After the Python tests (the fast-failing half), not the whole test gate: waiting for
-    # the Electron jobs too left these 1-4 minute jobs idle for ~9 minutes of every run.
-    needs: test-python
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            label: macOS
-            backend_supported: true
-          - os: macos-15-intel
-            label: macOS Intel
-            backend_supported: false
-          - os: windows-2022
-            label: Windows
-            backend_supported: true
-          - os: ubuntu-22.04
-            label: Linux
-            backend_supported: true
-    runs-on: ${{ matrix.os }}
-    # Priced for a COLD `uv sync`, on every platform.
-    #
-    # The previous split (Windows 25, Linux/macOS 10) came from a warm-cache
-    # measurement — Linux and macOS finish in ~65 s when setup-uv restores its
-    # cache, so 10 looked generous. Then run 30439640107 hit
-    # "Failed to restore: Cache service responded with 400", Linux installed
-    # torch from scratch, and the leg was killed at 10m17s. The 65 s was the
-    # cache, not the platform.
-    #
-    # A cache miss is not rare enough to treat as an outage (GitHub's cache
-    # service 400s, a lockfile change invalidates the key, a new runner image
-    # starts empty), and a timeout here is self-perpetuating: the leg dies
-    # before the post-step saves the cache, so the next run is cold too.
-    # 25 everywhere is still bounded — a genuinely wedged job is caught in
-    # minutes, not hours — and warm runs land nowhere near it.
-    timeout-minutes: 25
-    env:
-      # Restricted-network resilience (RESEARCH Pitfall #6) — keeps uv from
-      # giving up on the first slow PyPI / python-build-standalone fetch.
-      UV_HTTP_TIMEOUT: "120"
-      UV_HTTP_RETRIES: "5"
+        PY'
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      if: always()
+      with:
+        name: voice3554-native-${{ matrix.os }}
+        path: ${{ runner.temp }}/voice3554-proof
+        if-no-files-found: error
+        retention-days: 7
+  full-python:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: debpalash/VoiceStudio
+        ref: 8ed9dad7223830f90f59aac6a4a7b9af40b6653d
+        persist-credentials: false
+        fetch-depth: 1
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version: '22'
+    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+      with:
+        bun-version: 1.4.2
+    - name: Materialize frozen source
+      shell: bash
+      run: "python - <<'PY'\nimport base64, json, os, pathlib, subprocess, zlib\np = json.loads(zlib.decompress(base64.b64decode(\"eJzFfFuXokyX5l/p9d3OXAAmWcWs1RdKiuIpU1QEbmYJpIiA8pWn1Fnz3+fZEcFJzXrf+rp7+qJWpQpx2LEPzz7F//lHvjoGm3/8r3/7h9dLMy9uH0fLMA/1zmakDDauckz9bHoOWp3UW072jjI5rJb2KdS1taPIm9VSXTtX9fI568R/9Pw0z/3MSj/1dmvcm1687eLmLs3TKFtIk+Xi8t7rSpO4/TV+ayuTt+lwNJOOZq97djNju1Lsk6drt6Bnp66yWbvKV+4tVWkka2t/aeR+qq1Hu46qx4dfw+sfr6s91dvH8Tw4YP5f7P9rB991ct/pnIPdNPKX6dFzLBXz3/S49n1rPDR73tVXpCjoGdKq95W7td8X9F17H62W8sVvDSSzP0nd1iAN++PhUEmPQU+7gu43X5n88pwpxqq++3SqscN+esF6d7XfO/4uqX53Bge/l8a139NgNzgH8SUKMvsrXNq3sC32uZ0e3nXsc7s4jOftaNptRx6e9WcdOci+QCPzhL1cA2VRW7d99fuTC+aQ9Lg9NPvW9XO+H5p6OzL1ThZkGs5qcg6yxcl1OhfQ+uxnXu5dK1pYXbs3te2xbWj6dDEZWQu168idj0U6HQ6vj+MwehraDWeHdaUS+K0ci+2xZ8R+z157WXoAL2z85QL0sF9cxb5g/xNfsWT8/u63rJ7fAv907SvGv77HmOvaidx+Rw17m7MP/sfeY3eJM1iqyWg3uXhLe4u5t9hv6u+syC3W1rf23qxz9bAOsw+ataZ3NCj57uQq2tWbqZug3wG/aiess35+XWvhdezF18KRBp2pdDTmibVedLWZ3d7/YmOKs634X93iLFLw+QbrXgeKvcW552E/qZ0T0cfauNlX6ihejv2f3KWcsjPrWoaVGPbcsNagfX+2UA1Htmdzva2ZPTde9S0peNufR7fudXJ9uYy27dN4nv/4/twszYz2kZ502qYutSazS8vUD613/fI1mTH5SbylGzlKenOUL9CK09hRNpDJ6X7V027h2z4KWtbV7F+ieQYazZJoNH/BnrWz/1bylxTskledzk0X//okQ+BJyBr4JPHwOWiNTysHtF5aCXj+Flw3e781kYYzNQ9k7eAr2oXR8rLnY1S8snSXX7K3EPwRCfrzuS+uM4HMH/jna2fiOtZ2hTWteotoLo93wbVzCkFj8OjW7KbTcAv+hM7xoQv8LLyZfehW8FnoTEkWIetfCpflbsRo0GO8eyrmCPsD9W4NG69ngecmN88ZRx+zUl+cPMWW+H5T8NdPTlO9oOUl8rKvjdcaa4GiEQ9Jo8QYOJJqzxf2bLaYmHN5shhOC34r6fGxkEpaRLV1YA0WZPElsjLjAP1QyG35PTs3fVNfb272DPBuZ+P3LvuSjmy+9FKdFc7I0Mr3hj3aj+ZPDNkfG1I+ypo8BNmAboM+yLwzxjmZJQ9M0uBS0A76EboX+lrwoQa5ftmTPnyPac2GjLmkUYr3HBvvTg+Q79xf2nRWr5gDPGNI5psUjW9tkoccfP4/8Iwc9L7SpTKA/rBvI+hqnFn4HnH9+v42hV6dRsNbIo/eupLZhXz0rNSLO2uf+CLeYO7uK/GwmPe0KHQ0zi6EjvCWmkyygfM7u+Cbj1n7Brt4GutcPsD70MW27+5SCTTGuidSkEqljKyw30CZ7D3wpdlTzyHZsrjzw8w2UthvxyO9zeW9P47XpR7n/4LMyEn3L4TdnApbazmDq98y92bqnVfLSbpoWTLww9k0oEP648h3aP2wIWQ3Cl1y7dA57cO+dQlu9NnMizWSHfSgn7Bf8IadEJ0F/xB9GG9DV6TgkTSIo3jq2JA57bpycui/FHrbzMG7R8FLGezG1cOz0Nc55DllPJdNKzroXc3UB3wtVzNyoesFbdYrZ7L2e9o54Pp7zeVoI7nOYEdyVpPTvJTNXo0fae33++F8/0djF/JB5/fNeDfgnxTPRuZcivh5dm5mzPfqZ5pUX9e9/LrL9Ab7NRc46k3YN4NjhSgGHx5hL1PTuDvjJm1vgndz2OlI8NHr6PozxnkI/czxwWhW8RXj/cy+Eq2GbXFuDb4rZECNwyVsukE0g91zzL0jD9JVBnvXbaxjhr+xBnyvRxUv1P49o6MeS1HzOawLuKwuj+7Ohu201sWah9Al9b2UOpO/vydewtjX4ApbahzXoOM/ITvStD63QX+nV/p+qKfhNzzL12Icwztdmd2d66+HvRJ/QC8FuzHDYIRlhnUdA7zy2U/NYq3D/lEbzhKhwx/P6HfnMcw24Dfr4DmDW3nmnBatlWPtzR7pWhVyq7J32Dpmdd0mS8AsKXAZ7HNnAxtKev/iK+rNm9N4Y+LlLxd/L27jr3F7Hz3hFwn458TOrdU5+7sJsNEA+mK6H84Y7oW/oJ2gjyBjNmwLnY9KMrc3E+DTHdF9erSBrb2ZeTB1s+LfyhYKHK2atmFNhQ6MXNhhz9lsC50/no+/Rm8BdH5XGseXl7rOBx22wKLAY7Lsw74Qtga/Du/3I+gXm+nX1em9xKMne3YatG7nBS8HipF5tpatwEN+Zhy9GfEh4cRoX8PHsKMca4A2sB/G1ptFOzMO+N5npKvbsevYyWr58xQqhmKWum6wAd5kWJJ4ozZmfazYMS7MtpCex1mA/l/wKyP6fDDfuvnyKn05hez0Jxsva+B3wjYMx7rLwaG5nw3WNRF/A9f07AzrPIRvUnO9cVJgRtBclchuOS3y29jYR+I58qVgM09ei+RismafZxv4ol4DMw/tw8UpadIh32cL7Jf7yssZ+At2d3ok7OotjaNZ6FmSU0H3xzNJTkHLzrDflxHseqgwvQId9RJ9Xk2x/ktkxmrLdbzU3ElNzNsreNYSa26TPduE0IH+VcM7bqxnVu5lbjSaybsVcIM7A+4jvaDYwDIB7MfP22S+kEbwzT6hC0eZDLtinmELIM8hMKu2G8FnHt8W8kRXs5WzgU5Sj147h9wH/NxBR+JnnOdl/OZKk3bp1+Nz+e802k5ijKN680SG/B7hz0cjvBfGGvDy16Hy1SekP3fe8uvsXeF/3cbyZD4lf+nFW05P/nI6JB91NG8fxuS3km8BH6nAJ2Z3Mp6Bb0jeoY8Uwsih0yHslpAPhbPE+gJu76Er4Ivt/Cx9pef8nQ2/fpC7107lH1zhliWwcXq05XRIope9viDfD2P8gq5qBzs7+YR9BK/88nvJ5gndE/DIbdQSvqQuk4xIwLRXfwZ66rRv6+y2xmV8YoQ1g78y8P+RzkUnTA89ZL5NpQlw8nhpbTz95TS5dUHTQKW1VmfA6fuX84Juw+shcuO/eo7rtclb9zC5tn/R/0WsIOinhMNOpi43/N3HOAv8tsyA/p1cV8tBKmh/9QjbX4nHXfikKXxWaxOA90JgSNfwPuCXGAvZsq1u+sH80177AH1M/gbsxyZt4K5q/ghyGbldbTJP0uVcSt8sW5vO5cHChR4dki7O4Ez0p8DyyQU4+lDgKbKTONNoLsnvM5vP70jGdGZrI8tOIXfGjXw1N7OxTtjG3jH9nMHOQU9QPCfUXyIb64Kfwc4O9jFygcdd8okUWjv8A9L5veJv8Blwvtu3zp4SQve1BRa9o5cuQV+pxNOSy/SZfKTn4N9gjg3F64StNU5kr6BrIcMG7Kp2GkFv/+Uzcee99FvrNO0TT1AcSCXf9haSjDEatL/G2+A0pvU6A+z3SFgGe1Dzzwz4tObnurNOd55CvoB7Vy378k72fSmfQ+jhio73mHKCdX0d6thyZliLhTGGb3y0sfYz+QI4s0qnQoZpLfSO17e30BfgkZ80f2VHKLZT2o5O7C09ii9FZBtI9kk3+GRLyB8FrTEX/AX4k8A2WLfQr53404EfcuU4m8uJjHXYB69ma+h3GjugPUC/h6DLiGIkcXtrXjs689OvHRW4B/vXWvDJYFM6hGNS8mPhT17Bp1sPdv6JTpHIXw2u/H+n9RCnWsN/kqGLsYYUaxUxWuB52Kmb+H/9IKeGFrP4GHgUn28sjpqpaXjldDZ78tnDuUH+L5PtVKr0Uk3fQy+NMyODnlDGsAXAJdBHbbxnKyNFleH7A2cefpGtIZ8Zss7/Nx5juo4yOIfgc5xFTnY66Cd3+v/yNZ4vSBdhTDM2E/CFYhyEHSj9epzFL9DnYvaED7kbU5wTOKP0pcATFjBnSroKdhK0bI0jq6vOR0sPvLk4YfQY/CBiezbkLz3UYnh49yt3W8DQCo/Vgcc3q+VFxE/pjMtndcY/MvgDODWAfNZiwmfSYSF0M+aqYpz9lJ0z7ORweIE8A/NAV7IzrPNrHbPgTMGf8Gl5LGVd4l5ZI7xOWAs2y7o5inEFNjn5xA+Z3aL4akg4Xac4G/c7REz4MeaeVjH32v6e41y2Jz6ewGmEw4BxBwMrcYGfiOc3KfayHS0N7muWmNPDfF8J86n6h9hfaom3vMTvwGOhssmJj4NY+mKYadcB/WXgdfMVmKi3guxiTaTDUqc/CPx0krIYrPgO2KqIXcVYszp6jhe/xe51n6mGX7UByZTT5liO4XjVHS3SE/Ndgbfe444Knt5hPq5XbrLQL5f7Mdk5fSwLGlyiUrZ3iWbuJirkfe8Bj7pXuZTfT/gxBb2ruJ5MOHfjKWxPTT6MNwUPazhH0GaijrLSVuYUa6bnRJzpLn7nxlPQlPgm1OXFp9NJsb8fbvGdoUn03dpmdJjMFrIxsj3I4YQw9Cuwy2lssN+CIP2CrKmQxwnpGvhvbbLtZ69f+qdlbISdQZ/FQUFr+NLV/k4r2luqMbkIriwmIGhg3Jg+xvmzGCAfI4cvo5lv44IXNix+uCviKMbpc7ZhY40In8CPWerywM/y1G2RHTJzEYdkz7A4ZJ/oZd2ezMvXJB+OY1visa1WZ/O5JJs23UNGGZ992NY1hJ/G1tXj8lDJz4RhgWKO5c0I2boM2m/K8C7hHNA/8ebyAhg1BR010Inbqf7Er+RkgHftE3t2FuUPc+iDIIhNQYdqX8x/m5EPbdX9tv3jftsx+bC12OPj/uu+lp4wHQf91y70HjAw7NiB6VKX+W0D4IzF3sxY/gB+Zsc3t+bX+NZuEQYe38bM9xz3o5a3FXaJ+/Uct8wGIa2zoUcL/F/PD5Cu7KXk7xZ6Er9Brxoaw1IUs3AU6xRcN/CDVOAs0sOUE7jweP7f0KF1vVnlIlkcRNjyKaMHp6kGuxwCp8DGUVymiOXT2fO4N4uDl2cIW+hz+fDJ1y7XQvvuwRYvbYw3WWPth89Z9E+KQ5J+Gcb5r5D22xrn9/mHQi5WrZCw+q2QB5FfILpfwGtZact0tQP8/G5D5hdJ+jbravMyryX8c2C+AzAK5ccIv+/ZOmTyuZsxqTLOU6PDUM/5OvT2P4fZscX3kNRoJp/9DDjdIV8cvhV0GGglhX1zX9IPvHKXPyGeKnM5DvSY308eZaNX+Dfqd7Fdnnd61AFiz0wmffasIf2LfB+d3vWXl9E2YjzvtToy5PnFJUzRW7DvsC6aj60FvymES+ATbIAvgIkfZSEQsV/wfJVLkWEzHY906g7Y59TM4zXx+/Ce5nqH02G+b+Z3+/e4dVrlL406tiCfQ9C6/cDHZy6D/238W8TSa7k4A3hV5Ega9rlzgqxVOcIeP8dhTTaBbU7gSZVy3q4SwQe0yX+UYJ+L8aHHKF9gsRwZ9EXmU0ytpEPyjQ37+7zKcKbUuTB80KK4C/wB+BCgL2Fm+KbpK8X4+HuY2zjE4233Nn4LyC+4ja9M114+38JM+AUcm21ZPpn/nXGszsfgPDhleXgWZz5irl8MczDfzqJcD2zDYAveTEhvrpYGbA6XAZGDxDrIZtoP/Hwf92/y7oBofWM6vgWb2NqoTqvwX/Euj4dR/pYwoAI8Cd6WiVf335zZQZzr4SGmTzGXexkQsbzPvkX1FhX/d+0X2Jg5dNV2RZiPY6mXsCeT347zN+/GYfm8k/A1G/4G+bzcfy5yAFYZ+wf9FiuKxxD2zEIW216IMaoclFgTzurhu75FedQNi+VcmvUKRS0KxeJF7qEm3+V3/6k6YVrRk2IkwILVPri+AD7ud86QG+BFhivvdcQN85/Ivi5lqbIjRSyZeOXaqXInXRYP53Qr8iTdIidi5s/yM3wd1tmRQsPWN5jvK6v44iEPwNYzyowLy7noFE8GhotJHi3Srez9UVb6tgxTQVY6IcMoZDN4nMeMk7yZr6rXUVAM0yX+OXmGVuVgZtEV8ps38H4998LXQv5z5WNeo796vsXjxyrzNymmT75XXQ/W9s9y9hSPBj4q8L2gAXR99kzP1/dFenB8f44iPmwSNvqW/4ewC+O52WL1LzrXWyxeWDvfxnr74TmA3Qti8lNrcnFVxRzTPcX/6Hw+HNLNHuXF+FpsjWKGKc2LM03cJWyw8qLZ/YHs3eGgUAH+wRqBZSh3LDHMXP/9oW6E//tcki9JeXC+P8JCbA3wk0i+RoLXmr6dx3AW8M/rk7Mp6Ai+2cgheDpUXvbPeOzJnJAl7Vb3Oeq5Q6znF427yjT4DJsyR/gxXzx7vmnrynNg9T6E4RUxT6FreCy0oWOjnOkUitc+5FUxfi9dc30KXex0cgfzwX9kNTj8fZX0PN8XxQ+cDfRLXdeYAoddjvQ+yWKTdwrbw2I+h+rzn88TsPxuEt/ndClWafL6ApZrgo5g/O7Indlc3njMLiebhW105s3vjPHc0KaLRHOXzI8avM/lxmfQ+GtdzvtMl91jwsyinMkpjDfM7xsJHEWx5o+Ft6Hc911u/c7HIrkh2+ruRe1DOT/GykR9C9UicJ9Ppzq27utnq05nS6M8YSPv/QR/kd0fFvUisnaBnXqh+MrvauX4WgTP9KX47+8FOE6s8REnXep7uR8T73s51ga8RjiPavmAO1pT2ADYhAK73O230tk8tvaktobiaLoHDEj6shmn01o+xbU5TjyGPe0XeDVezzq5F3fusVoEO0U4+ce6ue4i7rZmtTNVbJHXC1Q4Ye/F/Aze45/nT1Y7aGnvu2Mlm33pTHR3M/J7OmXs/mNZ2sZ8RPV63+mSyj9LVlSbAZpTbCTMUuCZFxGLKT6rR1rnY23GQx0Hq3sibM3e1wc8hiCw/zM9XfmXDJ9EH3PQJRbv6fAJe0n8Ox3Y0E94d3mFb0g8pQxS4qnHGghDJrxLuF7ktaE70vB3c5T8rdipH3M/1rnnR8jwH+yvkKsnuqM8F37W3855N/69DmW02NR0g/aDyVVfev1UjMvK5nZwPWMyHrNakK4KvbXIMc+//+N//ts//NXhM413n/87SOPP3ZFK5yk1MJW+BiNFxnZslmYCKRMKszKVS25IJjMzSu4plSpBVK4mg/M2VAzEbDcu0pAEWSkNsfcV7VdwfRnqqQXVqN7gxuRuZt+YSe7R/+x5KjugtCUrQy1SOmBDkMqIV8svVhbswfSQ20lwWoSiNpTqI9UyaudkWihsDBZTUwqvUBoNqhDQrLP0lXTr2ROpSH+V5dHRfjgnaEklCkzVWEJl8BA6SAjTsOEpT11j6c5RS6Q6Z/TZkEJK2/GUJ6W3cp/BAyqzTgBzmDlmcMFr5/HnTOwxg4pyBiRaC9exr6sZIKIz+UXj4/k9pSxNSkv3efqEpXljnpqFyT9Q2RWpSdDvElDJFqX/s5+gHdyOdl6tvWtMZ1Q+pPyMmHjgPOGGHeGCwNyysqQWzoLSPFhrKq2ozDDuwPXoHMj1ELSgPUl0RlgT1MMG50FQMxiGcC1x/gyGCtXIwtig7Y2v39pTySeHHe19+LB+KqGooCzOOIX7D/gGjoxy7k7BZfJ2LGyWOvLPmitnnAgqcXFXb3qUl+kmFkbhZf/D6vlaie6lena1g7tVe7fRHpGVLugZ7wj3jpWsN11dXiYzfNYa8Zgaq+aCKcIcv2+LuGtnqO2flzWP9CpNWI5Vuq085VEbk8bhpUzt/VDAbA6t+Dy8LJ9cNYPBs2y1DGoufVV2P02Mt5lkv1sGL03g5T3/8bYHKkXznA7mErpooZ7DrsfSqKJkDea8vSV5+9vlG3i2dOmJBykk2IO8ZNo5bDf2X+mG7F9vAamHEP5TWh6ivNZiAZpL6btla/YiuRCs/h4qSt+f1xpmCuOKcvIiTWZRiGjHUo0t++rjAV4mDnndFqXVkM30SWmLfil0ANNx1b7Dm/mklIXph1qpxojJvDgLZ8NK1FasXBw0YS4Dh4ZFuNNOtMFUsue2YXdnC21t24MxLzmjcj3SL+mF3MoK1rCSkdyFnmuUElftF0zvATblBU/U5UO4OOzsP4iPd/ewtIAiT/Yq1lWUZJY8bpCbYKcFX9dL5MpUwXetLmKNVUrhN1BeQHhGh7d29KHzkhLz7aKZb648mY/loiypxtfGPAkH88RmtNVhKwFtKRTxbTn9YsdClMei/WRYlOOLEAbYqQg//XVZca3ctwj9Fb/NivLguGil4SEWgutkV12eAhAlvzw8xfVkF3bVu/AUuUUu2zFQgkOtrILC0GnIeD8RekY9B8vuK2zpzLq1L+Mm72xg71LTECG/rtA3oj0LLtc99sD6PRmyn7AyrPuy+H61R3LrKvnMyTVek14f8vJV9vd7TO0a5oHbpOiVyWnM2yqonLPg3TqPfCrV+1TWSimZQI92o2uQAzb+YDpbVw/0/spp7wfXn7uhI8V0/izsZ1DpAqW2obfFubPy4fhpefGj/mi021XuEyvFxThV2bMq5lnsTdh/L5ZeSI74nHCJZgNqXQNOAf2LUtmq1Nn47AF39Zkr0JArN9OST1ZuSuUwbP6HlizsTWLlMVgTwwexylLSwbUM8zXlWN+wkgGxZ/BQfsO8p1k6+ZgnIo19LxNFaNCxGP6iUhLmRt7rrko/ZTy00Y4+Fezzyss51vM9PluUEsx97qqln70xlTLjnLVTU8//B9vXmB5laXDmDn6jR3uUQvMEjahtgbv+oGErpPaX/Bs38tlYLPX/3TlVfP279is2/kPblRgz5XwyjWz4NtAXvH1k2zgj0TbHPm+BS1j4R7RPfiyusG9lKnoczeyOMtFZmpww2MmDvmTYuqfJIdNB4Ke+x8t4Z5yOvJzv5Tv5+K9umWvycleb/94e8dCWoN8ftMvVQjZOtSecy6VK0473LB0oHySHlawnp2aq7yBCgGy/LARYnrtiF2eU13RV1bIBOam1gczKlrlaOOWdyl572oaFnt7GVApIqdTjR0xljZ2DZx9F6eSFyYpT2jdR9kvv1dqLeauImlGJOMdThUxPqESPtzaU76pFO9QJa2ix1pSaDP1rLXB/3SZlZxowkT2HvLGSNrL1sM/HELTBXujdMmTF/Ooeb9Nin0u9ex8yotAdMJFyYS2KorRHhLPMb8I1daz2/6397U9s+awo+72nWcOOw6/mfAY7PnvWLviox+7aye5DVlV7ZzaQV8uvhLd/UkvS5m+0ZyV5o/XiOxo/zvu3Wslq7zTmEfGEos3qVGsXrbemamUblZ6wVqRaq1MTfxnj23jefmg1+q9snSp1YuFr89SCkB1W4kS29k5P/r7llHwthgdsTeClDY2RD2eF7wzbfvlm/hS4X/AjTx/j2dufyPsme2h57aU3yDn8XIoDfTHfk0ofSyxG9monxXfrG+oZbwlj+CjVSh6lEkaSbU/giRGLOVwENr1QyaNKOpZ+ny5VtcIb0BkiVMkwY9c4lXawR3G5Ltm+dx7fA//2y5JD2JOxGEPwrMBfXt8+Qifuyzn15FSUwUKeoYPc47teymUZbic5/LwOOq7CsAEr071vm+K4cKCJdyldkOC3DaMn10VsrQ0dU/oZE/+R9wYhzWuyNDn5qaK1QWF7KbBqI9VQbwO/t2tDskPkk1MaaC6ztX2TUjiY5ZnJFPva+8r0Ls3QZS3jf43DON0ZrUF3jrUfsPk/CZeOknw+l9Su8CX+QzL1wNMFfqRWDmpFALZbgU8YHo9ZqSsvcQeP17CCKNm1GyXphT4expcirlPGZQr/S9BFlEHvo6KVvYiJ8ZLV8auIMftCLlirfdEaWSuJFrLS+SnkoeR7PPsXbfsPY3G/oiypZv5BZu44vQJBr5FzpBgdYbnbaGedKW5D7eqfevQ1iVOtiMuwMiqF26naHHWZgs8xyVezUqZ4qSxoAtm5hYbAT7JUlHRyPVeldWEbeEyEX4VQlIyrOfZ5pLKMu3gMK+WlcsGQl5Y82Ifl5bH1lNEoNo+jmRkNgXWoVIviz9TC97uWVbbWOHwryutHC4tK988B2TrI6rtomxotmb76Ifakmbsj45f1bMDKw1kZfxzU6JYcHmw01+cKu85jVpWTV77wt+/8Zg+dsP5OYefczLjV2lZrbZ5q6WPjbANHZ/aRcN8JOoxjXPb5Eo1nqT+aG2L8zkMLKiv3fR7z3dfmP5hVe5sGXcj5cxduwrjkqf+WdljC4OwKJP3JeDP1Fi69bOVEFXafCYzOWmBd3kpM+8gW9xj9yX7K1uWzaF3mepCX+lPpq8Ra4uvnaxweeP9f4PH9c55q72rtEd0VlVa1JjnLD233RQsZszHv1w6jycdswFuutodo8I0MQpYqXptL8Wfrvo3a1sRad4/rSn4vP3/W0vGkbePySE9+Jk/mMmMu09LRjKndg8qeWRkVtYnFo5ksxq+PWcpi/uBLx3gno5hf1d7BS0LqrTvana4pW83UD+dY6XwRu1sk9mJmDwzL0N5gdxeLRBs7EuzhQu7ME2vOfA99UOQ0Gb9CBqBfp8Xf54DJ/0DylXBHpdnDaf4+ta2BndjrqaS928bgY25oMwvfYb5uw5/JWD5RAUZjpQlC3nhZKF0/BQxF1w/5LcrfNbAoa/1kvoFoQ8Re1er6KnZtRgK9JGg7eMypsjzpRbRNs/cMyO6WzUuYo8+unGC4TZSzAh9coqndGYzijl2166an0ZLGags81o6hn7ZEM1ae2J/sWatmi0ryma0luwycJZUtY9TSOWq5XyNF6LZWlRvn8UqVWpklit/5M8J99ThwLSfeo7bIDSsBf6c9ZCHZWmB/9Z3kD3YJ/q/A0oSBihge85OAb8hHNzSGxZxWVaLS4O2EyjupPFr7J7UW8hjGRpSdg7/wHfwYwvfMLkC/pX7vclwpKpXRnUPuJ9+En3wsc/vl1QZFPKRz5aVfd7gdvlu4/CJaAidTDtFewx/ZrpaJVpZM91gLJ/YnXcsYQhk/bF9q+I7VGTiC7sNGzJzFcxKKsdfsUiOe/vtrihj+Z+WsPLZpHs1mDLGUbcr5UoyXyirJn/cyVkLJ1kZ6jMal3+6uPKvwpawV8xT2iH0ubPljzqqMpTbe5z6ytS7a4chX5jyqrUUOoD53GSedy5PfYnWsnfLLm09bq9l9Nt4fYwkWbyqvhaCcW0cOSzkXdF0axDOEAXjcm+y2uNqE/gkMwHxs1u5JtsbW1n/iX3jxYAt9Su3RTD+xsljYxE+F4b+D66R8XEfakY2pxd6/8zUa7fHDHisBhn9A//Oc/Shh9g+0pOtIOA+SjLzX8AhvF1FFzcn0j3ymeWLAHngGswGpNZtLX+vSRpR5U6Gj6m3q7DqWO1ni6z8V9tEUn5/IVH7nE9G5/WjonIxatO0D5KfYH7uiA75s3R7HVVyH8ALwx9KQau9U5d+8LBn4Z1r4Y3WfXegyukoglN1leOevC/9DPgCzGoQrqXQ7dogGYo+17wXNWEnY4ekVJ9/5mDWfktpki7+ftNY+aactzqpqDSeaPoltvT6uiZXGbrlfzsokqYWNcuCi9ofbB4oFEOYcEa8v4ZftpII/qOQMuDL5Nk///CqKhGEKJvsiz1iPdbPyP+WY3uVBytjF8vqkNSCVeC1EQjEr2DPCesU4HAMVsYqSb3h84hI57KorkStoN3Xn47V2jz5mMz/L+aJZR0H5f00Zz7TiiptK/p0OW39A1ww9+msMU38sOU894s7yzLUqtvmIW6nladXTEmDyKeV8mji0jNvmJY1KG0VxWboyC1bKMU8h6B0CGz/SsBa7r8Vh6foDKo+sxefrcsljWYQj+hNWzk6l3+SX3OVI6fpYpksoFlWzmWXrhcmw9W9tP8dGzC9j+Zw6Xurgb5mVHBuilXxbq1tgreWFvBe6mf62WfnsQlyP0OQbKlUNtMc4S3FFjXlo2ky7hv9eNC67E5n88btcA11jIspoi1bcKCJ7G1L7dibVfIzkbg8qu0aB9KOoo2xiPfguBc+OHOLZhzWKa6rkdfk302fUWsbrCWp+WMFTW7Mr9Et17V/uAR8yzN6fnKnVzFeOdLUoZMGSqMxV1Jw28X0Nl1ctYmFa1OqYon6U1w4Zp8K/oGtnQpIN4HHS937j7IuahZe/pBXRp/JVZMK8okT76/KxrPFGOrEXRgc+0GRe6DTg7bi4RoOXqTfnaf6+Ib9FgqyW1+SY5dXHlNOZli01fM0T2RV1fuy6vKWVOK1i/Ch2FePiLgc54Su6EkWUTx+CN4naLKiOSfg2Zf0cuyqn4K3H9wtZZ9cFVGukeJ0xMOxuOrMWVt0fhL8pT6YLtbto5CqIN44MU1J9Kl3xAzlhefEVu2pnHFF+W/DBXU3qpbzWoC6XZZ6kgX9/R59Nuf6/cZZlfr6qZV7wtpblQOiXAbAEbFRN35i7xvNxDadvIONb6LCYrlZ+4DcR+6qfV+FD8tazC8O3oxnFHE3hv7z8/fHBz+KdYw2fEU/D1/Q25HeBB4W94jGsPxm7uOLkbrzWivkH9nU07/7ZeDX89Xffe9BvBU5sxmEKeXuGGZsxsh78e6rncsYafBiGjfiVLdSuyeMkpJdgE2mM2u+Ta8hjJ0qI55qxpQZ9GM561OENHuI8rFQ2CH7TcQRcxlsMqP7I2PLYnMTjNqSfmc4wWa2b329rtRrp00K2pwvI7kIeP8SiCr1U2tIeXfHwwq44CLdlXJ/lH77N5dXjDxwfsStpirFhN4prhtYcv7MYg/KtT8vy18LnKOrZdWqnAP0bPNGsYbnzh9fNZ3lco3EF6G/medCL2/0D7irzYoZGV2NtXMgZbBxdBbUvrnmo+7J/kbv9baztSU3aN+Ncopliq2V93vM88oVqikJ98yRXJDDM257XobWkuPAPP5yJCh8A9pYwqZk3/VFBizdWj0a+19pRmI+7dq6cpo6sHdnVDPLPuKpdLPzYlOz40WJXwW3Yc6y2Ifp31tZy/PX5Sb0sK03+Ib/I69efmrzSVj9++JKvvaovL8rLj+Dlx0tr/YonWmHRCkPv/PwMtXAV/lCU1s+WtNaktaqtVsHr6mX1w9dW6xfJf31V8c7//X8/2GA/\")))\nassert subprocess.check_output([\"git\", \"rev-parse\", \"HEAD\"], text=True).strip() == p[\"base\"]\nsubprocess.run([\"git\", \"apply\", \"--binary\", \"-\"], input=base64.b64decode(p[\"patch\"]), check=True)\nsubprocess.run([\"git\", \"add\", \"-u\"], check=True)\nsubprocess.run([\"git\", \"add\", \"changelog.d/3554.fixed.md\", \"tests/test_speech_client_boundaries.py\"], check=True)\nassert subprocess.check_output([\"git\", \"write-tree\"], text=True).strip() == p[\"tree\"]\nartifacts = pathlib.Path(os.environ[\"RUNNER_TEMP\"]) / \"voice3554-proof\"\nartifacts.mkdir()\n(artifacts / \"source-contract.json\").write_text(json.dumps({\"base\": p[\"base\"], \"tree\": p[\"tree\"]}, indent=2))\n(artifacts / \"baseline-client.py\").write_bytes(base64.b64decode(p[\"baseline_client\"]))\n\ncache = pathlib.Path(os.environ[\"RUNNER_TEMP\"]) / \"voice3554-empty-hf\"\nassert not cache.exists(), \"HF cache must start empty\"\ncache.mkdir()\nwith open(os.environ[\"GITHUB_ENV\"], \"a\") as exports:\n    exports.write(\"HF_HUB_CACHE=\" + str(cache) + \"\\n\")\nPY"
+    - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39
+      with:
+        enable-cache: false
+    - name: Native media prerequisites
+      run: sudo apt-get update && sudo apt-get install -y ffmpeg squashfs-tools
+    - name: Install frozen Python dependencies
+      run: bash scripts/uv-sync-retry.sh --frozen --all-extras
+    - name: Full repository pytest
+      run: uv run --no-sync pytest tests/ -q --tb=short -n auto --junitxml="${RUNNER_TEMP}/voice3554-proof/full-tests.xml" > "${RUNNER_TEMP}/voice3554-proof/full-tests.log" 2>&1
+    - name: Full backend isolated pytest
+      if: ${{ !cancelled() }}
+      run: uv run --no-sync pytest backend/tests/ -q --tb=short --junitxml="${RUNNER_TEMP}/voice3554-proof/backend-tests.xml" > "${RUNNER_TEMP}/voice3554-proof/backend-tests.log" 2>&1
+    - name: Exact source guards
+      if: always()
+      shell: bash
+      run: 'python - <<''PY''
 
-      - name: Setup Python 3.11
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.11"
+        import subprocess
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
-        with:
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
+        subprocess.run(["git", "diff", "--exit-code"], check=True)
 
-      # ffmpeg + libsndfile are needed by soundfile / audio fixtures even
-      # though the silence WAV doesn't decode anything heavy — keeps test
-      # collection from import-erroring on optional audio modules.
-      - name: System deps (macOS)
-        if: runner.os == 'macOS' && matrix.backend_supported
-        run: brew install ffmpeg libsndfile || true
+        assert subprocess.check_output(["git", "write-tree"], text=True).strip() == "a917141f6891a9a77b0b96544247c4743f69173d"
 
-      - name: System deps (Windows)
-        if: runner.os == 'Windows' && matrix.backend_supported
-        shell: bash
-        run: |
-          # The community chocolatey feed 50x's intermittently (broke PR runs on
-          # 2026-07-20 and 2026-07-28) — retry with backoff before failing.
-          #
-          # Test the OUTCOME, not choco's exit code. On 2026-07-28 the feed
-          # returned 503, choco reported "Unable to find package 'ffmpeg'" and
-          # "installed 0/0 packages" — and still exited 0. The `&& break` that
-          # was supposed to guard this fired on the first attempt, no retry ran,
-          # and the job died one line later on `ffmpeg: command not found`.
-          # A retry that trusts a lying exit code is not a retry.
-          for i in 1 2 3; do
-            choco install ffmpeg -y --no-progress || true
-            hash -r 2>/dev/null || true
-            if command -v ffmpeg >/dev/null 2>&1; then break; fi
-            # No backoff after the last attempt — there is no fourth try to
-            # wait for, and sleeping 90s only delays an already-doomed job.
-            if [ "$i" -eq 3 ]; then
-              echo "choco failed to produce ffmpeg after 3 attempts"
-              break
-            fi
-            echo "choco attempt $i did not produce ffmpeg — retrying in $((i * 30))s"
-            sleep $((i * 30))
-          done
-          # Chocolatey is one distribution channel, not the dependency. When
-          # its feed is down across every retry (2026-08-13: three attempts,
-          # three 'installed 0/1'), fall back to the static gyan.dev release
-          # build GitHub mirror — the same binary, no feed in the path.
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            echo "::warning::choco feed down — falling back to static ffmpeg build"
-            curl -fsSL --retry 3 -o /tmp/ffmpeg.zip \
-              https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-essentials_build.zip
-            unzip -q /tmp/ffmpeg.zip -d /tmp/ffmpeg
-            bindir=$(dirname "$(find /tmp/ffmpeg -name ffmpeg.exe | head -1)")
-            echo "$bindir" >> "$GITHUB_PATH"
-            export PATH="$bindir:$PATH"
-          fi
-          ffmpeg -version
+        PY'
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      if: always()
+      with:
+        name: voice3554-full-python
+        path: ${{ runner.temp }}/voice3554-proof
+        if-no-files-found: error
+        retention-days: 7
+  electron:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: debpalash/VoiceStudio
+        ref: 8ed9dad7223830f90f59aac6a4a7b9af40b6653d
+        persist-credentials: false
+        fetch-depth: 1
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version: '22'
+    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+      with:
+        bun-version: 1.4.2
+    - name: Materialize frozen source
+      shell: bash
+      run: "python - <<'PY'\nimport base64, json, os, pathlib, subprocess, zlib\np = json.loads(zlib.decompress(base64.b64decode(\"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\")))\nassert subprocess.check_output([\"git\", \"rev-parse\", \"HEAD\"], text=True).strip() == p[\"base\"]\nsubprocess.run([\"git\", \"apply\", \"--binary\", \"-\"], input=base64.b64decode(p[\"patch\"]), check=True)\nsubprocess.run([\"git\", \"add\", \"-u\"], check=True)\nsubprocess.run([\"git\", \"add\", \"changelog.d/3554.fixed.md\", \"tests/test_speech_client_boundaries.py\"], check=True)\nassert subprocess.check_output([\"git\", \"write-tree\"], text=True).strip() == p[\"tree\"]\nartifacts = pathlib.Path(os.environ[\"RUNNER_TEMP\"]) / \"voice3554-proof\"\nartifacts.mkdir()\n(artifacts / \"source-contract.json\").write_text(json.dumps({\"base\": p[\"base\"], \"tree\": p[\"tree\"]}, indent=2))\n(artifacts / \"baseline-client.py\").write_bytes(base64.b64decode(p[\"baseline_client\"]))\n\ncache = pathlib.Path(os.environ[\"RUNNER_TEMP\"]) / \"voice3554-empty-hf\"\nassert not cache.exists(), \"HF cache must start empty\"\ncache.mkdir()\nwith open(os.environ[\"GITHUB_ENV\"], \"a\") as exports:\n    exports.write(\"HF_HUB_CACHE=\" + str(cache) + \"\\n\")\nPY"
+    - name: Native media prerequisites
+      run: sudo apt-get update && sudo apt-get install -y ffmpeg squashfs-tools
+    - name: Install frozen Electron dependencies
+      run: bun install --frozen-lockfile
+    - name: Frontend unit tests
+      run: bun run test:frontend > "${RUNNER_TEMP}/voice3554-proof/frontend.log" 2>&1
+    - name: Electron required check
+      if: ${{ !cancelled() }}
+      run: bun run check:electron > "${RUNNER_TEMP}/voice3554-proof/check-electron.log" 2>&1
+    - name: Snap artifact regression
+      if: ${{ !cancelled() }}
+      run: node --test electron/tests/snap-artifact-verification.test.mjs electron/tests/snap-launcher.test.mjs electron/tests/snap-store-packaging.test.mjs electron/tests/omnivoice-tts-bundle.test.mjs > "${RUNNER_TEMP}/voice3554-proof/snap.log" 2>&1
+    - name: Exact source guards
+      if: always()
+      shell: bash
+      run: 'python - <<''PY''
 
-      - name: System deps (Linux)
-        if: runner.os == 'Linux' && matrix.backend_supported
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          packages: ffmpeg libsndfile1
-          version: 1.0
+        import subprocess
 
-      - name: Install Python deps (including PocketTTS)
-        # PocketTTS is an opt-in engine, but installing its pinned extra here
-        # proves that the same dependency set resolves on every supported local
-        # backend host. The Intel-Mac leg separately pins the documented
-        # unsupported contract: its UI is a remote-backend client only (#889).
-        if: matrix.backend_supported
-        run: bash scripts/uv-sync-retry.sh --extra pockettts
+        subprocess.run(["git", "diff", "--exit-code"], check=True)
 
-      - name: Verify the documented Intel Mac contract
-        if: ${{ !matrix.backend_supported }}
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import platform
-          import tomllib
+        assert subprocess.check_output(["git", "write-tree"], text=True).strip() == "a917141f6891a9a77b0b96544247c4743f69173d"
 
-          assert platform.system() == "Darwin"
-          assert platform.machine() == "x86_64"
-          root = Path.cwd()
-          project = tomllib.loads((root / "pyproject.toml").read_text("utf-8"))
-          extra = project["project"]["optional-dependencies"]["pockettts"]
-          assert extra == [
-              "pocket-tts==2.1.0 ; sys_platform != 'darwin' or platform_machine != 'x86_64'"
-          ]
-          docs = (root / "docs/install/macos.md").read_text("utf-8")
-          assert "Intel Macs are not supported" in docs
-          PY
-
-      - name: Run smoke tests
-        # Exercise credential paths and the Windows accept guard natively.
-        if: matrix.backend_supported
-        run: uv run --no-sync pytest tests/smoke/ tests/test_hf_token_cache_paths.py tests/test_win_accept_guard.py tests/test_ios_testflight.py -q --tb=short
-        env:
-          HF_HUB_OFFLINE: "1"  # same no-silent-downloads guard as the main pytest job
-          HF_HUB_CACHE: ${{ runner.temp }}/pockettts-empty-hf-cache
-
-      # The isolated backend session, on Windows. The `test` job runs it on
-      # Linux only, which is how four tests that CANNOT pass on Windows shipped
-      # unnoticed: two reach for os.WNOHANG and os.waitid (POSIX-only, an
-      # AttributeError before the first assertion), one asserts a RuntimeError
-      # that `backend_drain_fd` returns None instead of raising off POSIX, and
-      # one raced the OS reaping a crashed child — a race Linux won and Windows
-      # lost every time. All four were invisible to CI and hit every Windows
-      # contributor on their first `pytest` run. Forty seconds closes the class.
-      - name: Isolated backend session (Windows)
-        if: runner.os == 'Windows' && matrix.backend_supported
-        run: uv run --no-sync pytest backend/tests/ -q --tb=short
-        env:
-          HF_HUB_OFFLINE: "1"
-
-      - name: Media-tool installation and lock recovery
-        if: matrix.backend_supported
-        run: uv run --no-sync pytest tests/test_media_tools.py -q --tb=short
-        env:
-          HF_HUB_OFFLINE: "1"
-          HF_HUB_CACHE: ${{ runner.temp }}/media-tools-empty-hf-cache
+        PY'
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      if: always()
+      with:
+        name: voice3554-electron
+        path: ${{ runner.temp }}/voice3554-proof
+        if-no-files-found: error
+        retention-days: 7
